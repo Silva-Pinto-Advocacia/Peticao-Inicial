@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Silva Pinto Advocacia — Gerador de Petições</title>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,600;1,300;1,400&family=Montserrat:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --gold: #BB904C; --gold-l: #D4AA6A; --gold-pale: #F5EDD8;
+  --dark: #1A1A1A; --mid: #3A3A3A; --light: #F9F7F4;
+  --white: #FFFFFF; --border: #E0D5C5; --red: #C0392B; --green: #27704C;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family:'Montserrat',sans-serif; background:var(--light); color:var(--dark); min-height:100vh; }
+
+header {
+  background:var(--dark); border-bottom:2px solid var(--gold);
+  padding:16px 40px; display:flex; align-items:center; gap:16px;
+}
+.logo-ring {
+  width:42px; height:42px; border:2px solid var(--gold); border-radius:50%;
+  display:flex; align-items:center; justify-content:center; flex-shrink:0;
+}
+.logo-ring svg { width:20px; height:20px; fill:var(--gold); }
+.htext h1 { font-family:'Cormorant Garamond',serif; font-size:1.3rem; font-weight:600; color:var(--white); letter-spacing:.04em; }
+.htext p  { font-size:.63rem; font-weight:300; color:var(--gold-l); letter-spacing:.12em; text-transform:uppercase; margin-top:1px; }
+
+.container { max-width:860px; margin:0 auto; padding:36px 24px 80px; }
+.page-title { font-family:'Cormorant Garamond',serif; font-size:1.9rem; font-weight:300; color:var(--mid); margin-bottom:3px; }
+.page-title span { color:var(--gold); font-style:italic; }
+.page-sub { font-size:.68rem; font-weight:400; color:#888; letter-spacing:.1em; text-transform:uppercase; margin-bottom:32px; }
+
+.card {
+  background:var(--white); border:1px solid var(--border); border-radius:4px;
+  padding:28px 32px; margin-bottom:18px; position:relative;
+}
+.card::before {
+  content:''; position:absolute; top:0; left:0;
+  width:3px; height:100%; background:var(--gold); border-radius:4px 0 0 4px;
+}
+.card-title {
+  font-family:'Cormorant Garamond',serif; font-size:1.05rem; font-weight:600;
+  color:var(--dark); margin-bottom:18px; display:flex; align-items:center; gap:10px;
+}
+.badge {
+  background:var(--gold); color:var(--white); font-family:'Montserrat',sans-serif;
+  font-size:.58rem; font-weight:600; letter-spacing:.08em; padding:3px 8px; border-radius:2px;
+}
+label { display:block; font-size:.67rem; font-weight:600; letter-spacing:.1em; text-transform:uppercase; color:#666; margin-bottom:6px; }
+input[type="password"], input[type="text"], textarea, select {
+  width:100%; padding:10px 13px; border:1px solid var(--border); border-radius:3px;
+  font-family:'Montserrat',sans-serif; font-size:.81rem; color:var(--dark);
+  background:var(--light); transition:border-color .2s; outline:none; margin-bottom:16px;
+}
+input:focus, textarea:focus, select:focus { border-color:var(--gold); background:var(--white); }
+textarea { resize:vertical; min-height:88px; line-height:1.6; }
+.row2 { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+@media(max-width:580px){ .row2{ grid-template-columns:1fr; } }
+.hint { font-size:.67rem; color:#aaa; letter-spacing:.04em; margin-top:-10px; margin-bottom:14px; }
+
+.dropzone {
+  border:2px dashed var(--border); border-radius:4px; padding:32px 20px;
+  text-align:center; cursor:pointer; transition:all .25s; background:var(--light);
+  margin-bottom:16px; position:relative;
+}
+.dropzone:hover,.dropzone.over { border-color:var(--gold); background:var(--gold-pale); }
+.dropzone input[type="file"] { position:absolute; inset:0; opacity:0; cursor:pointer; width:100%; height:100%; margin:0; padding:0; border:none; }
+.drop-icon { font-size:1.9rem; margin-bottom:8px; }
+.drop-text { font-family:'Cormorant Garamond',serif; font-size:1rem; color:var(--mid); }
+.drop-sub  { font-size:.66rem; color:#999; margin-top:3px; letter-spacing:.06em; }
+
+.file-chip { display:none; align-items:center; gap:10px; padding:9px 13px; background:var(--gold-pale); border:1px solid var(--gold); border-radius:3px; margin-bottom:16px; font-size:.79rem; color:var(--mid); }
+.file-chip.show { display:flex; }
+.fname { font-weight:600; color:var(--dark); }
+.fsize { color:#888; font-size:.7rem; margin-left:auto; }
+.rm-file { cursor:pointer; color:#aaa; font-size:1.1rem; margin-left:8px; }
+.rm-file:hover { color:var(--red); }
+
+.btn {
+  display:inline-flex; align-items:center; gap:10px; background:var(--gold); color:var(--white);
+  border:none; border-radius:3px; padding:13px 28px; font-family:'Montserrat',sans-serif;
+  font-size:.77rem; font-weight:600; letter-spacing:.1em; text-transform:uppercase;
+  cursor:pointer; transition:background .2s; width:100%; justify-content:center; margin-top:2px;
+}
+.btn:hover { background:var(--gold-l); }
+.btn:disabled { background:#ccc; cursor:not-allowed; }
+
+/* Progress */
+#prog-wrap { display:none; margin-top:20px; }
+.prog-track { background:#eee; border-radius:3px; height:5px; overflow:hidden; margin:14px 0 6px; }
+.prog-bar { height:100%; background:var(--gold); width:0%; transition:width .5s ease; border-radius:3px; }
+.prog-label { font-size:.71rem; color:#888; letter-spacing:.06em; }
+
+/* Log */
+#log {
+  display:none; background:#F8F5EF; border:1px solid var(--border); border-left:3px solid var(--gold);
+  border-radius:3px; padding:14px 16px; max-height:280px; overflow-y:auto;
+  font-size:.74rem; line-height:1.8; color:var(--mid); margin-top:12px;
+  white-space:pre-wrap; word-break:break-word; font-family:'Courier New',monospace;
+}
+
+/* Result */
+#result { display:none; margin-top:20px; }
+.res-card { background:var(--white); border:1px solid var(--gold); border-radius:4px; padding:24px 28px; }
+.res-title { font-family:'Cormorant Garamond',serif; font-size:1.15rem; font-weight:600; color:var(--green); margin-bottom:14px; display:flex; align-items:center; gap:8px; }
+.res-section-title { font-size:.67rem; font-weight:600; letter-spacing:.1em; text-transform:uppercase; color:var(--gold); margin:16px 0 8px; border-bottom:1px solid var(--border); padding-bottom:4px; }
+.tag-list { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px; }
+.tag { background:var(--gold-pale); border:1px solid var(--border); border-radius:2px; padding:3px 10px; font-size:.72rem; color:var(--mid); }
+.tag.warn { background:#FFF8E7; border-color:#FCECC0; color:#8a6500; }
+.tag.err  { background:#FDF2F2; border-color:#F5C6C6; color:var(--red); }
+.dl-btn {
+  display:inline-block; background:var(--gold); color:var(--white); border:none; border-radius:2px;
+  padding:8px 22px; font-family:'Montserrat',sans-serif; font-size:.73rem; font-weight:600;
+  letter-spacing:.08em; text-transform:uppercase; text-decoration:none; cursor:pointer; margin-top:14px; width:100%; text-align:center;
+}
+.dl-btn:hover { background:var(--gold-l); }
+
+/* Error */
+#error-box { display:none; background:#FDF2F2; border:1px solid #F5C6C6; border-left:3px solid var(--red); border-radius:3px; padding:13px 15px; font-size:.79rem; color:var(--red); margin-top:14px; line-height:1.6; }
+
+footer { text-align:center; padding:26px; font-size:.64rem; color:#bbb; letter-spacing:.08em; text-transform:uppercase; border-top:1px solid var(--border); }
+footer strong { color:var(--gold); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo-ring">
+    <svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm1 14.93V15a1 1 0 0 0-2 0v1.93A8 8 0 0 1 4.07 11H6a1 1 0 0 0 0-2H4.07A8 8 0 0 1 11 4.07V6a1 1 0 0 0 2 0V4.07A8 8 0 0 1 19.93 11H18a1 1 0 0 0 0 2h1.93A8 8 0 0 1 13 16.93z"/></svg>
+  </div>
+  <div class="htext">
+    <h1>Silva Pinto Advocacia</h1>
+    <p>Sistema Automatizado de Petições — Concursos Públicos</p>
+  </div>
+</header>
+
+<div class="container">
+  <h2 class="page-title">Gerador de <span>Petições Iniciais</span></h2>
+  <p class="page-sub">Inteligência Artificial Jurídica · OAB/RJ nº 189.781</p>
+
+  <form id="form" enctype="multipart/form-data">
+
+    <!-- 01 API KEY -->
+    <div class="card">
+      <div class="card-title"><span class="badge">01</span> Chave de API Anthropic</div>
+      <label for="api_key">Chave de API (Claude)</label>
+      <input type="password" id="api_key" name="api_key" placeholder="sk-ant-api03-..." autocomplete="off">
+      <p class="hint">A chave é usada apenas para esta requisição e não é armazenada pelo servidor.</p>
+    </div>
+
+    <!-- 02 ZIP -->
+    <div class="card">
+      <div class="card-title"><span class="badge">02</span> Arquivo ZIP do Cliente</div>
+      <p class="hint" style="margin-bottom:12px;margin-top:-6px;">Deve conter: modelo.docx, ficha do candidato (XLSX), documentos de identidade e relatórios técnicos das questões.</p>
+      <div class="dropzone" id="dz">
+        <input type="file" name="zip_file" id="zip_input" accept=".zip">
+        <div class="drop-icon">📦</div>
+        <div class="drop-text">Arraste o ZIP aqui ou clique para selecionar</div>
+        <div class="drop-sub">Apenas .zip</div>
+      </div>
+      <div class="file-chip" id="file-chip">
+        <span>📦</span>
+        <span class="fname" id="fname"></span>
+        <span class="fsize" id="fsize"></span>
+        <span class="rm-file" id="rm">✕</span>
+      </div>
+    </div>
+
+    <!-- 03 CASE -->
+    <div class="card">
+      <div class="card-title"><span class="badge">03</span> Dados do Caso</div>
+      <div class="row2">
+        <div>
+          <label for="tipo_acao">Tipo de Ação</label>
+          <select id="tipo_acao" name="tipo_acao">
+            <option value="">— Selecione —</option>
+            <option value="Ação Anulatória de Ato Administrativo com Tutela de Urgência">Ação Anulatória com Tutela de Urgência</option>
+            <option value="Tutela de Urgência Cautelar Antecedente">Tutela Cautelar Antecedente</option>
+            <option value="Mandado de Segurança">Mandado de Segurança</option>
+            <option value="Ação Ordinária">Ação Ordinária</option>
+          </select>
+        </div>
+        <div>
+          <label for="comarca">Comarca / Juízo</label>
+          <input type="text" id="comarca" name="comarca" placeholder="Ex: Comarca de Vitória/ES">
+        </div>
+      </div>
+      <label for="fatos">Resumo dos Fatos</label>
+      <textarea id="fatos" name="fatos" placeholder="Concurso, banca, cargo, pontuação obtida, nota de corte, questões contestadas..."></textarea>
+      <label for="pedidos">Pedidos Adicionais</label>
+      <textarea name="pedidos" style="min-height:68px;" placeholder="Pedidos específicos além dos padrão (opcional)..."></textarea>
+      <label for="obs">Observações</label>
+      <textarea name="obs" style="min-height:68px;" placeholder="Dados ausentes, instruções especiais, documentos faltantes... (opcional)"></textarea>
+    </div>
+
+    <button type="button" class="btn" id="submit-btn" onclick="submitForm()">
+      <span>⚖️</span><span>Gerar Petição Inicial</span>
+    </button>
+  </form>
+
+  <!-- PROGRESS -->
+  <div id="prog-wrap">
+    <div class="prog-track"><div class="prog-bar" id="pb"></div></div>
+    <div class="prog-label" id="pl">Iniciando...</div>
+    <div id="log"></div>
+  </div>
+
+  <!-- ERROR -->
+  <div id="error-box"></div>
+
+  <!-- RESULT -->
+  <div id="result">
+    <div class="res-card">
+      <div class="res-title">✅ Petição gerada com sucesso</div>
+
+      <div class="res-section-title">Cliente</div>
+      <div id="r-cliente"></div>
+
+      <div class="res-section-title">Questões Inseridas</div>
+      <div class="tag-list" id="r-questoes"></div>
+
+      <div class="res-section-title">Alterações Realizadas</div>
+      <div class="tag-list" id="r-changes"></div>
+
+      <div class="res-section-title">Renomeação de Arquivos</div>
+      <div class="tag-list" id="r-rename"></div>
+
+      <div id="r-ausentes-wrap">
+        <div class="res-section-title">Dados Ausentes</div>
+        <div class="tag-list" id="r-ausentes"></div>
+      </div>
+
+      <a id="dl-link" class="dl-btn" href="#" download>⬇ Baixar ZIP Final</a>
+    </div>
+  </div>
+</div>
+
+<footer><strong>Silva Pinto Advocacia</strong> · Sistema Interno · Uso Exclusivo do Escritório</footer>
+
+<script>
+const dz       = document.getElementById('dz');
+const zipInput = document.getElementById('zip_input');
+const chip     = document.getElementById('file-chip');
+let hasFile    = false;
+
+dz.addEventListener('dragover',  e => { e.preventDefault(); dz.classList.add('over'); });
+dz.addEventListener('dragleave', ()  => dz.classList.remove('over'));
+dz.addEventListener('drop', e => {
+  e.preventDefault(); dz.classList.remove('over');
+  const f = e.dataTransfer.files[0];
+  if (f && f.name.toLowerCase().endsWith('.zip')) setFile(f);
+  else showErr('Por favor, envie apenas arquivos .zip');
+});
+zipInput.addEventListener('change', () => zipInput.files[0] && setFile(zipInput.files[0]));
+document.getElementById('rm').addEventListener('click', () => {
+  hasFile = false; zipInput.value = '';
+  chip.classList.remove('show'); dz.style.display = '';
+});
+
+function setFile(f) {
+  hasFile = true;
+  document.getElementById('fname').textContent = f.name;
+  document.getElementById('fsize').textContent = fmtSize(f.size);
+  chip.classList.add('show'); dz.style.display = 'none';
+}
+
+function fmtSize(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
+  return (b/1048576).toFixed(1) + ' MB';
+}
+
+function prog(pct, label) {
+  document.getElementById('pb').style.width = pct + '%';
+  document.getElementById('pl').textContent = label;
+}
+
+function logLine(t) {
+  const box = document.getElementById('log');
+  box.style.display = 'block';
+  box.textContent += t + '\n';
+  box.scrollTop = box.scrollHeight;
+}
+
+function showErr(msg) {
+  const el = document.getElementById('error-box');
+  el.textContent = '⚠ ' + msg;
+  el.style.display = 'block';
+  document.getElementById('prog-wrap').style.display = 'none';
+  document.getElementById('submit-btn').disabled = false;
+}
+
+function clearUI() {
+  document.getElementById('error-box').style.display = 'none';
+  document.getElementById('result').style.display = 'none';
+  document.getElementById('log').textContent = '';
+  document.getElementById('log').style.display = 'none';
+}
+
+function tags(containerId, items, cls='') {
+  const el = document.getElementById(containerId);
+  el.innerHTML = '';
+  (items||[]).forEach(t => {
+    const span = document.createElement('span');
+    span.className = 'tag ' + cls;
+    span.textContent = t;
+    el.appendChild(span);
+  });
+}
+
+async function submitForm() {
+  clearUI();
+  const apiKey = document.getElementById('api_key').value.trim();
+  if (!apiKey)   return showErr('Insira sua chave de API Anthropic.');
+  if (!hasFile)  return showErr('Selecione um arquivo ZIP.');
+
+  const btn = document.getElementById('submit-btn');
+  btn.disabled = true;
+  document.getElementById('prog-wrap').style.display = 'block';
+  prog(5, 'Enviando arquivos...');
+  logLine('📦 Preparando envio...');
+
+  const fd = new FormData(document.getElementById('form'));
+
+  try {
+    prog(15, 'Processando no servidor...');
+    logLine('🚀 Arquivo enviado ao servidor. Aguardando Claude...');
+
+    const res = await fetch('/gerar', { method: 'POST', body: fd });
+    prog(75, 'Recebendo resposta...');
+    logLine('📥 Resposta recebida.');
+
+    const data = await res.json();
+
+    if (data.error) {
+      showErr(data.error);
+      return;
+    }
+
+    prog(100, '✅ Concluído!');
+    logLine('✅ Petição gerada com sucesso!');
+    logLine(`📄 Arquivo: ${data.docx_filename}`);
+    logLine(`📦 ZIP: ${data.zip_filename}`);
+
+    // Populate result
+    const c = data.cliente || {};
+    document.getElementById('r-cliente').innerHTML =
+      `<span class="tag">${c.nome_completo||''}</span>
+       <span class="tag">${c.cpf||''}</span>
+       <span class="tag">${c.cidade||''}/${c.uf||''}</span>`;
+
+    tags('r-questoes', (data.questoes||[]).map(q => `Questão ${q.numero} — ${q.vicio}`));
+    tags('r-changes', data.changes||[]);
+
+    const renameItems = Object.entries(data.rename_map||{}).map(([k,v]) => `${k} → ${v}`);
+    tags('r-rename', renameItems);
+
+    const ausentes = data.dados_ausentes||[];
+    if (ausentes.length) {
+      tags('r-ausentes', ausentes, 'warn');
+    } else {
+      document.getElementById('r-ausentes-wrap').style.display = 'none';
+    }
+
+    const dlLink = document.getElementById('dl-link');
+    dlLink.href = `/download/${data.session_id}/${encodeURIComponent(data.zip_filename)}`;
+    dlLink.download = data.zip_filename;
+    document.getElementById('result').style.display = 'block';
+
+  } catch(e) {
+    showErr('Erro de comunicação com o servidor: ' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+</script>
+</body>
+</html>
