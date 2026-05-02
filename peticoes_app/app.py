@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 # ── VERSION MARKER — change this every release to confirm deploy ──────────
-APP_VERSION = "v34-2026-05-02-protecao-com-word-boundary"
+APP_VERSION = "v35-2026-05-02-pares-auto-ementa-questoes"
 log.info("=" * 70)
 log.info("🚀 SilvaPinto GeradorPeticoes %s INICIANDO", APP_VERSION)
 log.info("=" * 70)
@@ -774,6 +774,102 @@ def apply_substitutions(unpacked_dir: Path, data: dict, ficha: dict | None = Non
                                 found, num_correto
                             )
 
+        # ── AUTO-PAIRS: ementa "DE X PARA Y PONTOS" (caixa alta) ────────────
+        # The ementa typically has the pattern "DE 55 PARA 59 PONTOS" (caps).
+        # If we have both pontuacao_obtida and pontuacao_final from ficha,
+        # generate pairs to update any variation found in the document.
+        pont_obtida = ficha.get("pontuacao_obtida")
+        pont_final = ficha.get("pontuacao_final_calculada")
+        if pont_obtida and pont_final:
+            # Convert to int-strings if they're numeric
+            try:
+                obt_str = str(int(float(str(pont_obtida).replace(",", ".").split()[0])))
+                fin_str = str(int(float(str(pont_final).replace(",", ".").split()[0])))
+            except (ValueError, IndexError):
+                obt_str = str(pont_obtida).strip()
+                fin_str = str(pont_final).strip()
+
+            doc_xml_path = unpacked_dir / "word" / "document.xml"
+            if doc_xml_path.exists():
+                xml_now = doc_xml_path.read_text(encoding="utf-8")
+                text_now = re.sub(r"<[^>]+>", " ", xml_now)
+                text_now = re.sub(r"\s+", " ", text_now)
+                # Find all "DE N PARA M PONTOS" patterns (caps and lowercase)
+                ementa_patterns = [
+                    re.compile(r"\bDE\s+(\d+)\s+PARA\s+(\d+)\s+PONTOS\b"),
+                    re.compile(r"\bde\s+(\d+)\s+para\s+(\d+)\s+pontos\b"),
+                    re.compile(r"\bDe\s+(\d+)\s+para\s+(\d+)\s+pontos\b"),
+                ]
+                for pat in ementa_patterns:
+                    for m in pat.finditer(text_now):
+                        old_obt, old_fin = m.group(1), m.group(2)
+                        if old_obt != obt_str or old_fin != fin_str:
+                            old_phrase = m.group(0)
+                            # Build the new phrase preserving case style
+                            if old_phrase.isupper():
+                                new_phrase = f"DE {obt_str} PARA {fin_str} PONTOS"
+                            else:
+                                new_phrase = old_phrase.replace(old_obt, obt_str, 1)
+                                new_phrase = new_phrase.replace(old_fin, fin_str, 1)
+                            if old_phrase != new_phrase:
+                                pairs.insert(0, {
+                                    "buscar": old_phrase,
+                                    "substituir": new_phrase,
+                                })
+                                log.info(
+                                    "Sistema gerou par automático ementa: '%s' → '%s'",
+                                    old_phrase, new_phrase
+                                )
+
+        # ── AUTO-PAIRS: lista de questões antigas (várias formas) ───────────
+        # The ficha tells us the correct list of question numbers. Find all
+        # references to old question lists in the model (e.g., "10, 25, 31 e 34")
+        # and replace them with the correct list, covering common phrasings.
+        questoes_anular = ficha.get("questoes_anular", "")
+        if questoes_anular:
+            keep_nums = _parse_question_numbers(questoes_anular)
+            if keep_nums:
+                # Format the new list: "1, 6, 10, 18, 31 e 74"
+                sorted_nums = sorted(keep_nums)
+                if len(sorted_nums) == 1:
+                    new_list_str = str(sorted_nums[0])
+                elif len(sorted_nums) == 2:
+                    new_list_str = f"{sorted_nums[0]} e {sorted_nums[1]}"
+                else:
+                    new_list_str = ", ".join(str(n) for n in sorted_nums[:-1]) + f" e {sorted_nums[-1]}"
+
+                doc_xml_path = unpacked_dir / "word" / "document.xml"
+                if doc_xml_path.exists():
+                    xml_now = doc_xml_path.read_text(encoding="utf-8")
+                    text_now = re.sub(r"<[^>]+>", " ", xml_now)
+                    text_now = re.sub(r"\s+", " ", text_now)
+
+                    # Look for any list of 2+ comma-separated numbers ending with " e N"
+                    # Examples: "10, 25, 31 e 34" or "questões 10, 25, 31 e 34"
+                    list_pat = re.compile(r"\b(\d{1,3}(?:\s*,\s*\d{1,3}){1,10}\s+e\s+\d{1,3})\b")
+                    for m in list_pat.finditer(text_now):
+                        old_list = m.group(1)
+                        # Don't replace if it's already our correct list
+                        if old_list == new_list_str:
+                            continue
+                        # Try to detect if these numbers look like question numbers
+                        # (typical question numbers are 1-150). If the list contains
+                        # a wide spread, be cautious.
+                        nums_in_list = re.findall(r"\d+", old_list)
+                        try:
+                            n_vals = [int(n) for n in nums_in_list]
+                            if all(1 <= n <= 200 for n in n_vals):
+                                pairs.insert(0, {
+                                    "buscar": old_list,
+                                    "substituir": new_list_str,
+                                })
+                                log.info(
+                                    "Sistema gerou par automático lista de questões: '%s' → '%s'",
+                                    old_list, new_list_str
+                                )
+                        except ValueError:
+                            continue
+
     log.info("Total de substituições a aplicar: %d", len(pairs))
     if not pairs:
         changes.append("⚠️ Nenhum par de substituição retornado pelo Claude")
@@ -784,6 +880,18 @@ def apply_substitutions(unpacked_dir: Path, data: dict, ficha: dict | None = Non
         new = pair.get("substituir", "").strip()
         if not old:
             log.warning("Par #%d: 'buscar' vazio, pulando", pair_idx)
+            continue
+        if not new:
+            # 'substituir' vazio APAGARIA o conteúdo do modelo. A regra é clara:
+            # se a IA não tem informação para substituir, deve MANTER o modelo.
+            # Bloqueamos pares com substituir vazio.
+            log.warning(
+                "Par #%d: 'substituir' VAZIO — apagaria conteúdo do modelo. "
+                "Bloqueado. buscar='%s'", pair_idx, old[:80]
+            )
+            changes.append(
+                f"⚠️ Par bloqueado (apagaria conteúdo): '{old[:60]}' → ''"
+            )
             continue
         if old == new:
             log.info("Par #%d: buscar==substituir, pulando", pair_idx)
