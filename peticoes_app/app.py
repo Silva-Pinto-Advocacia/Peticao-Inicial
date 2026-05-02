@@ -937,34 +937,57 @@ def _rewrite_questoes_chapter(xml: str, questoes: list) -> tuple[str, int]:
     # End of chapter heading paragraph
     p_end_marker = xml.find('</w:p>', p_start) + len('</w:p>')
 
-    # Now find the END of the chapter — next paragraph that looks like another chapter title
-    # (heuristic: ALL CAPS title >= 8 chars, mostly uppercase letters)
-    # Walk through paragraphs after chapter heading
+    # Now find the END of the chapter — next paragraph that starts with another
+    # chapter title (typically ALL CAPS).
+    # IMPORTANT: text in DOCX is split across multiple <w:t> elements within the
+    # same paragraph. We must aggregate all <w:t> belonging to the same <w:p>
+    # before testing against chapter title patterns.
     end_of_chapter_in_xml = p_end_marker  # default: just after heading
     next_chapter_keywords = [
-        r"DO\s+M[ÉE]RITO", r"DA\s+TUTELA", r"DOS\s+REQUERIMENTOS",
-        r"DOS\s+PEDIDOS", r"DA\s+ASSIST[ÊE]NCIA", r"DA\s+GRATUIDADE",
-        r"DO\s+VALOR\s+DA\s+CAUSA", r"DAS\s+PROVAS", r"DO\s+R[ÉE]U",
-        r"DO\s+JUIZADO", r"REQUER", r"TERMOS\s+EM\s+QUE",
-        r"DA\s+CITA[ÇC][ÃA]O", r"DA\s+ANULA[ÇC][ÃA]O\s+DAS\s+QUEST",  # explicit chapter
+        r"DO\s+M[ÉE]RITO\b", r"DA\s+TUTELA\b", r"DOS\s+REQUERIMENTOS\b",
+        r"DOS\s+PEDIDOS\b", r"DA\s+ASSIST[ÊE]NCIA\s+JUDICI[ÁA]RIA\b",
+        r"DA\s+GRATUIDADE\b", r"DO\s+VALOR\s+DA\s+CAUSA\b",
+        r"DAS\s+PROVAS\b", r"DO\s+R[ÉE]U\b",
+        r"DO\s+JUIZADO\b", r"TERMOS\s+EM\s+QUE\b",
+        r"DA\s+CITA[ÇC][ÃA]O\b",
+        r"DA\s+ANULA[ÇC][ÃA]O\s+DAS\s+QUEST",  # explicit chapter
     ]
-    next_chapter_re = re.compile("|".join(next_chapter_keywords), re.IGNORECASE)
+    next_chapter_re = re.compile(
+        r"^\s*(?:" + "|".join(next_chapter_keywords) + r")",
+        re.IGNORECASE
+    )
 
-    # Find next chapter title in concat after chapter_start_idx + chapter_title_len
-    # We skip 100 chars to avoid the chapter title itself
-    search_start = chapter_start_idx + 50
-    next_match = next_chapter_re.search(concat, search_start)
-    if next_match:
-        next_match_idx_in_concat = next_match.start()
-        # Find which match index corresponds
-        for s, e, i in positions:
-            if s <= next_match_idx_in_concat < e:
-                next_p_start_in_xml = xml.rfind('<w:p ', 0, matches[i].start())
-                if next_p_start_in_xml < 0:
-                    next_p_start_in_xml = xml.rfind('<w:p>', 0, matches[i].start())
-                if next_p_start_in_xml > p_end_marker:
-                    end_of_chapter_in_xml = next_p_start_in_xml
-                break
+    # Build paragraph -> aggregated text mapping by walking <w:p> boundaries
+    # Starting after the chapter heading paragraph (p_end_marker)
+    cursor = p_end_marker
+    next_p_start_xml = None
+    while cursor < len(xml):
+        # Find next <w:p> opener
+        p_open = xml.find('<w:p ', cursor)
+        if p_open < 0:
+            p_open = xml.find('<w:p>', cursor)
+        if p_open < 0:
+            break
+        # Find its closing tag
+        p_close = xml.find('</w:p>', p_open)
+        if p_close < 0:
+            break
+        # Extract aggregated visible text from this paragraph
+        para_xml = xml[p_open:p_close]
+        text_chunks = re.findall(r'<w:t[^>]*>([^<]*)</w:t>', para_xml)
+        para_text = "".join(text_chunks).strip()
+        # Test against chapter pattern
+        if para_text and next_chapter_re.match(para_text):
+            log.info(
+                "Capítulo das questões termina antes do título: '%s'",
+                para_text[:80]
+            )
+            next_p_start_xml = p_open
+            break
+        cursor = p_close + len('</w:p>')
+
+    if next_p_start_xml is not None and next_p_start_xml > p_end_marker:
+        end_of_chapter_in_xml = next_p_start_xml
 
     # Build new XML for the chapter content (after the heading paragraph)
     new_blocks_xml = ""
@@ -1254,16 +1277,22 @@ def _parse_question_numbers(text: str) -> set[int]:
     return set(int(n) for n in nums)
 
 
-def extract_questoes_from_relatorio(docx_path: Path, keep_numbers: set[int]) -> list[dict]:
+def extract_questoes_from_relatorio(
+    docx_path: Path,
+    keep_numbers: set[int],
+    tipo_prova_cliente: int | None = None,
+) -> list[dict]:
     """Parse a relatório técnico DOCX and extract structured data for the
     requested question numbers.
 
-    Strategy:
-    1. First look for a 'Resumos' section near the end with formatted blocks like
-       'QUESTÃO N — VÍCIO\\n Enunciado: ... \\n (A) ... (B) ...'
-    2. If not found, fall back to scanning the full text for 'Questão N' headers
-       and grouping paragraphs until the next.
-    3. Return list of dicts with: numero, vicio, enunciado, alternativas, relatorio_integra.
+    The relatório is organized as a series of sections, each starting with
+    'RELATÓRIO DE ANÁLISE FUNDAMENTADA DA LEGALIDADE DA QUESTÃO'. Each section
+    contains:
+    - "Identificação da questão" with optional line "Questão: Tipo 1: X | Tipo 2: Y |
+      Tipo 3: Z | Tipo 4: W" — type-equivalence table. If absent, the question
+      is common to all types (typically Q1).
+    - "Questão N" header followed by "Enunciado + alternatives" in same paragraph.
+    - Vício, análise, conclusão, requerimento sections.
     """
     if not keep_numbers:
         return []
@@ -1275,9 +1304,206 @@ def extract_questoes_from_relatorio(docx_path: Path, keep_numbers: set[int]) -> 
         log.warning("Falha ao abrir relatório %s: %s", docx_path.name, e)
         return []
 
-    results = {}  # numero -> dict
+    results = {}  # numero (no Tipo cliente) -> dict
+    tipo_use = tipo_prova_cliente if tipo_prova_cliente in (1, 2, 3, 4) else 4
 
-    # ── STRATEGY 1: Look for a 'Resumos' / 'Síntese' section ─────────────────
+    log.info(
+        "Extraindo questões do relatório (Tipo %s, pedidas=%s)",
+        tipo_use, sorted(keep_numbers)
+    )
+
+    # Find all section headers
+    relatorio_starts = []
+    for i, p_text in enumerate(paragraphs):
+        if p_text.strip().upper().startswith("RELATÓRIO DE ANÁLISE FUNDAMENTADA DA LEGALIDADE DA QUESTÃO"):
+            relatorio_starts.append(i)
+    log.info("Encontrados %d relatórios técnicos no arquivo", len(relatorio_starts))
+
+    if not relatorio_starts:
+        # Maybe the file is the "Resumos"-style only (different format) — fall through
+        return _extract_from_resumos_section(paragraphs, keep_numbers)
+
+    # Parse each section
+    for ri, h_idx in enumerate(relatorio_starts):
+        end_idx = relatorio_starts[ri + 1] if ri + 1 < len(relatorio_starts) else len(paragraphs)
+        # If a 'Resumos' section starts, end before it
+        for j in range(h_idx, end_idx):
+            if paragraphs[j].strip().lower() in ("resumos", "resumo", "síntese", "sintese"):
+                end_idx = j
+                break
+
+        section = paragraphs[h_idx:end_idx]
+        section_text = "\n".join(section)
+
+        # ── Detect question number for this section ──────────────────────────
+        # Try equivalence table first: "Questão: Tipo 1: X | Tipo 2: Y..."
+        m_eq = re.search(
+            r"Questão:\s*Tipo\s*1:\s*(\d+)\s*\|\s*Tipo\s*2:\s*(\d+)\s*\|\s*Tipo\s*3:\s*(\d+)\s*\|\s*Tipo\s*4:\s*(\d+)",
+            section_text
+        )
+        equiv = None
+        num_no_tipo_cliente = None
+        if m_eq:
+            equiv = {
+                1: int(m_eq.group(1)),
+                2: int(m_eq.group(2)),
+                3: int(m_eq.group(3)),
+                4: int(m_eq.group(4)),
+            }
+            num_no_tipo_cliente = equiv[tipo_use]
+        else:
+            # No equivalence table — try to find "Questão N" mentioned as common
+            # to all types, or just first "Questão N" reference.
+            # Pattern: "A Questão N aparece com o mesmo enunciado e as mesmas
+            # alternativas nos quatro cadernos de prova"
+            m_common = re.search(
+                r"[Qq]uest[ãa]o\s+(\d+)\s+aparece\s+com\s+o\s+mesmo\s+enunciado",
+                section_text
+            )
+            if m_common:
+                n = int(m_common.group(1))
+                num_no_tipo_cliente = n
+                equiv = {1: n, 2: n, 3: n, 4: n}
+            else:
+                # Fallback: first "Questão N" line as standalone
+                for sp in section[:25]:
+                    m_simple = re.match(r"^Quest[ãa]o\s+(\d+)\s*$", sp.strip())
+                    if m_simple:
+                        n = int(m_simple.group(1))
+                        num_no_tipo_cliente = n
+                        equiv = {1: n, 2: n, 3: n, 4: n}
+                        break
+
+        if num_no_tipo_cliente is None:
+            log.info("Relatório [%d]: número da questão não detectado — pulando", h_idx)
+            continue
+
+        log.info(
+            "Relatório [%d]: equivalência=%s → Q%s para Tipo %s",
+            h_idx, equiv, num_no_tipo_cliente, tipo_use
+        )
+
+        if num_no_tipo_cliente not in keep_numbers:
+            continue  # not in client's list
+
+        # ── Extract enunciado + alternativas ─────────────────────────────────
+        # Multiple formats possible:
+        # (a) Single paragraph with enunciado + (A)... (B)... all together
+        # (b) Enunciado in one paragraph, "(A) ... (B) ..." in next paragraph
+        # (c) "Questão N" header, then enunciado, then alternatives separately
+        enunciado = ""
+        alternativas = []
+
+        # Find paragraph(s) containing alternatives
+        alt_paragraph_idx = None
+        for j, p_text in enumerate(section):
+            # A paragraph rich in alternatives has at least 3 of "(A)", "(B)", "(C)"
+            count_alts = sum(1 for letter in "ABCDE" if f"({letter})" in p_text)
+            if count_alts >= 3:
+                alt_paragraph_idx = j
+                break
+
+        if alt_paragraph_idx is not None:
+            alt_text_block = section[alt_paragraph_idx]
+            alt_lines = [ln.strip() for ln in alt_text_block.split("\n") if ln.strip()]
+            # Find first alternative line within this paragraph
+            first_alt_line_idx = None
+            for li, line in enumerate(alt_lines):
+                if re.match(r"^\(\s*[A-E]\s*\)", line):
+                    first_alt_line_idx = li
+                    break
+            if first_alt_line_idx is not None:
+                # If there are lines BEFORE the first (A) in the same paragraph,
+                # those are the enunciado
+                if first_alt_line_idx > 0:
+                    enun_lines = alt_lines[:first_alt_line_idx]
+                    enunciado = " ".join(enun_lines).strip()
+                # Parse alternatives
+                for line in alt_lines[first_alt_line_idx:]:
+                    m_alt = re.match(r"^\(\s*([A-E])\s*\)\s*(.+?)\s*$", line)
+                    if m_alt:
+                        letra = m_alt.group(1)
+                        alt_text = m_alt.group(2).strip().rstrip(".").strip()
+                        alternativas.append(f"({letra}) {alt_text}")
+
+            # If enunciado is still empty, look BACKWARDS for previous paragraph
+            # that contains the question statement (typically right after
+            # "X. Enunciado da questão na íntegra" header or after "Questão N")
+            if not enunciado:
+                for j in range(alt_paragraph_idx - 1, max(0, alt_paragraph_idx - 6), -1):
+                    cand = section[j].strip()
+                    if not cand:
+                        continue
+                    # Skip "Questão N" header line
+                    if re.match(r"^Quest[ãa]o\s+\d+\s*:?\s*$", cand):
+                        continue
+                    # Skip section headers like "2. Enunciado da questão na íntegra"
+                    if re.match(r"^\d+\.\s+", cand) and len(cand) < 100:
+                        continue
+                    # Skip "Texto..." poetry/text passages
+                    if cand.startswith("Texto ") or cand.startswith("Texto I") or cand.startswith("Texto II"):
+                        continue
+                    # This is likely the enunciado
+                    enunciado = cand
+                    break
+
+        # ── Extract vício ────────────────────────────────────────────────────
+        vicio = ""
+        for j, p_text in enumerate(section):
+            txt = p_text.strip()
+            if re.match(r"^\d+\.\s*Vício\s+apontado", txt, re.IGNORECASE) or \
+               re.match(r"^Vício\s+apontado", txt, re.IGNORECASE):
+                # Take next non-empty line
+                for k in range(j + 1, min(j + 4, len(section))):
+                    nxt = section[k].strip()
+                    if nxt:
+                        vicio = nxt
+                        break
+                break
+
+        # ── Extract Conclusão (the literal "resumo" of this question) ────────
+        conclusao_lines = []
+        in_conclusao = False
+        for j, p_text in enumerate(section):
+            txt = p_text.strip()
+            if re.match(r"^\d+\.\s*Conclus[ãa]o", txt, re.IGNORECASE):
+                in_conclusao = True
+                continue
+            if in_conclusao:
+                # Stop at next numbered section (e.g., "10. Requerimento")
+                if re.match(r"^\d+\.\s+", txt) and not re.match(r"^\d+\)", txt):
+                    # Check if this is a new top-level section
+                    if "requerimento" in txt.lower() or "observação" in txt.lower() or \
+                       re.match(r"^\d{1,2}\.\s+[A-ZÁÉÍÓÚ]", txt):
+                        break
+                if txt:
+                    conclusao_lines.append(txt)
+
+        fundamentacao = " ".join(conclusao_lines).strip() if conclusao_lines else ""
+        fundamentacao = re.sub(r"\s+", " ", fundamentacao)
+
+        # If no conclusão, build a summary from the most relevant sections
+        if not fundamentacao:
+            fundamentacao = "\n".join(s.strip() for s in section[1:] if s.strip())
+            fundamentacao = re.sub(r"\s+", " ", fundamentacao)
+            if len(fundamentacao) > 2500:
+                fundamentacao = fundamentacao[:2500] + "..."
+
+        results[num_no_tipo_cliente] = {
+            "numero": num_no_tipo_cliente,
+            "vicio": vicio.upper() if vicio else "VÍCIO DE LEGALIDADE",
+            "enunciado": enunciado,
+            "alternativas": alternativas,
+            "relatorio_integra": fundamentacao,
+            "_equivalencia": equiv,
+        }
+        log.info(
+            "  Q%d (Tipo %d) extraída: vício='%s', enun=%dchars, %d alts, fund=%dchars",
+            num_no_tipo_cliente, tipo_use, vicio[:60],
+            len(enunciado), len(alternativas), len(fundamentacao)
+        )
+
+    # ── If 'Resumos' section exists, also try to enrich data from it ─────────
     resumos_start = None
     for i, txt in enumerate(paragraphs):
         clean = txt.strip().lower()
@@ -1286,203 +1512,121 @@ def extract_questoes_from_relatorio(docx_path: Path, keep_numbers: set[int]) -> 
                      "resumos das questões impugnadas"):
             resumos_start = i
             break
-
     if resumos_start is not None:
-        log.info("Seção 'Resumos' encontrada no parágrafo %d", resumos_start)
+        resumos_data = _extract_from_resumos_section(paragraphs[resumos_start + 1:], keep_numbers)
+        for q_resumo in resumos_data:
+            n = q_resumo.get("numero")
+            if n in results:
+                # Existing entry — only update fields that are empty
+                if not results[n].get("enunciado") and q_resumo.get("enunciado"):
+                    results[n]["enunciado"] = q_resumo["enunciado"]
+                if not results[n].get("alternativas") and q_resumo.get("alternativas"):
+                    results[n]["alternativas"] = q_resumo["alternativas"]
+                # Always prefer the longer fundamentação
+                if len(q_resumo.get("relatorio_integra", "")) > len(results[n].get("relatorio_integra", "")):
+                    results[n]["relatorio_integra"] = q_resumo["relatorio_integra"]
+            elif n in keep_numbers:
+                results[n] = q_resumo
 
-        # Each "Resumos" entry is typically packed into a single paragraph
-        # with internal \n line breaks. We expand each paragraph into its
-        # logical lines first.
-        expanded_lines = []
-        for p in paragraphs[resumos_start + 1:]:
-            for line in p.split("\n"):
-                line = line.strip()
-                if line:
-                    expanded_lines.append(line)
-
-        # Now walk through expanded lines, grouping by question header
-        current_q = None
-        block_lines = []
-
-        def commit_block(num, lines):
-            if num is None or num not in keep_numbers:
-                return
-            full_text = "\n".join(lines).strip()
-            if not full_text:
-                return
-            # Header is first line: "QUESTÃO 01 — VÍCIO (área)"
-            header = lines[0] if lines else ""
-            header_match = re.match(
-                r"^QUEST[ÃA]O\s*0*(\d+)\s*[—\-–]+\s*(.*)$",
-                header,
-                re.IGNORECASE,
-            )
-            vicio = ""
-            if header_match:
-                vicio_full = header_match.group(2).strip()
-                # Remove parenthetical area reference
-                vicio = re.sub(r"\([^)]*\)", "", vicio_full).strip()
-
-            # Find Enunciado: line index
-            enunciado = ""
-            alternativas = []
-            fundamentacao = ""
-
-            enun_idx = None
-            for i, line in enumerate(lines):
-                if re.match(r"^enunciado\s*:", line, re.IGNORECASE):
-                    enun_idx = i
-                    break
-
-            # Lines that are alternatives
-            alt_pattern = re.compile(r"^\(\s*([A-E])\s*\)\s*(.+?)\s*$")
-            alt_indices = []
-            for i, line in enumerate(lines):
-                m = alt_pattern.match(line)
-                if m:
-                    alt_indices.append(i)
-                    letra = m.group(1)
-                    alt_text = m.group(2).strip().strip('"').strip("”").strip("“")
-                    alt_text = alt_text.rstrip(',').rstrip('.').strip()
-                    alternativas.append(f"({letra}) {alt_text}")
-
-            # Enunciado = lines from after "Enunciado:" until first alternative
-            if enun_idx is not None and alt_indices:
-                first_alt = alt_indices[0]
-                enun_lines = lines[enun_idx + 1: first_alt]
-                # If the "Enunciado:" line itself has content after the colon, include it
-                enun_inline = re.sub(r"^enunciado\s*:\s*", "", lines[enun_idx], flags=re.IGNORECASE)
-                if enun_inline:
-                    enun_lines = [enun_inline] + enun_lines
-                enunciado = " ".join(enun_lines).strip().strip('"').strip("”").strip("“")
-                enunciado = re.sub(r"\s+", " ", enunciado)
-
-            # Fundamentação = lines after the last alternative
-            if alt_indices:
-                last_alt = alt_indices[-1]
-                fund_lines = lines[last_alt + 1:]
-                fundamentacao = " ".join(fund_lines).strip()
-                fundamentacao = re.sub(r"\s+", " ", fundamentacao)
-
-            results[num] = {
-                "numero": num,
-                "vicio": vicio.upper() if vicio else "",
-                "enunciado": enunciado,
-                "alternativas": alternativas,
-                "relatorio_integra": fundamentacao or full_text,
-            }
-            log.info(
-                "  Questão %d (resumos): vício='%s', enun=%dchars, %d alts, fund=%dchars",
-                num, vicio[:60], len(enunciado), len(alternativas), len(fundamentacao)
-            )
-
-        for line in expanded_lines:
-            m = re.match(r"^QUEST[ÃA]O\s*0*(\d+)\s*[—\-–]+", line, re.IGNORECASE)
-            if m:
-                commit_block(current_q, block_lines)
-                current_q = int(m.group(1))
-                block_lines = [line]
-            else:
-                if current_q is not None:
-                    block_lines.append(line)
-        # Commit last block
-        commit_block(current_q, block_lines)
-
-    # ── STRATEGY 2: For numbers still missing, scan from the top ─────────────
-    missing = keep_numbers - set(results.keys())
-    if missing:
-        log.info("Buscando questões faltantes na seção principal: %s", sorted(missing))
-        # Find each "Questão N" header and group everything until the next
-        # "Questão M" (any number) or until the "Resumos" section.
-        question_pos = []  # (paragraph_idx, numero)
-        for i, txt in enumerate(paragraphs):
-            clean = txt.strip()
-            # Match "Questão N", "Questão N:", "QUESTÃO N", etc., as standalone or at start
-            m = re.match(r"^[Qq]uest[ãa]o\s+0*(\d+)\b", clean)
-            if m and len(clean) < 200:  # avoid matching mentions in long sentences
-                num = int(m.group(1))
-                if num in missing:
-                    question_pos.append((i, num))
-
-        # End boundary: resumos section start, or end of document
-        end_boundary = resumos_start if resumos_start is not None else len(paragraphs)
-        # Also end at the next "RELATÓRIO DE ANÁLISE..." after each question
-        for idx, (pos, num) in enumerate(question_pos):
-            # Determine end of this question block:
-            # - next question header
-            # - or end_boundary
-            # - or next "RELATÓRIO DE ANÁLISE" header
-            next_pos = end_boundary
-            for next_idx in range(idx + 1, len(question_pos)):
-                if question_pos[next_idx][0] > pos:
-                    next_pos = min(next_pos, question_pos[next_idx][0])
-                    break
-            # Look for next "RELATÓRIO DE ANÁLISE" after pos
-            for j in range(pos + 1, end_boundary):
-                if paragraphs[j].strip().upper().startswith("RELATÓRIO DE ANÁLISE"):
-                    next_pos = min(next_pos, j)
-                    break
-
-            # Collect block
-            block = []
-            for j in range(pos, next_pos):
-                t = paragraphs[j].strip()
-                if t:
-                    block.append(t)
-            if not block:
-                continue
-            full_text = "\n".join(block)
-            # Extract enunciado: block usually starts with "Questão N: ..." or "Questão N\n..."
-            # The enunciado is the question statement
-            first_line = block[0]
-            # Try to capture statement after "Questão N:" or "Questão N"
-            m_stmt = re.match(r"^[Qq]uest[ãa]o\s+0*\d+\s*[:.]?\s*(.*)$", first_line)
-            stmt = m_stmt.group(1).strip() if m_stmt else ""
-            # If statement is empty, look in next paragraph
-            if not stmt and len(block) > 1:
-                stmt = block[1]
-            # Find alternatives in the block
-            alt_matches = re.findall(
-                r"\(\s*([A-E])\s*\)\s*([^()]+?)(?=\s*\(\s*[A-E]\s*\)|$)",
-                full_text, re.DOTALL,
-            )
-            alternativas = []
-            for letra, txt_alt in alt_matches:
-                alt_clean = re.sub(r"\s+", " ", txt_alt).strip().strip('"').strip('“').strip('”')
-                alt_clean = alt_clean.rstrip(",").rstrip(".").strip()
-                if alt_clean:
-                    alternativas.append(f"({letra}) {alt_clean}")
-            # Vício: try to find "vício apontado" or similar
-            vicio = ""
-            for j in range(pos, next_pos):
-                t = paragraphs[j].strip()
-                if "vício" in t.lower() or "vicio" in t.lower():
-                    # Take next non-empty paragraph
-                    for k in range(j + 1, min(j + 5, next_pos)):
-                        if paragraphs[k].strip():
-                            vicio = paragraphs[k].strip()[:80]
-                            break
-                    break
-
-            results[num] = {
-                "numero": num,
-                "vicio": vicio.upper() if vicio else "VÍCIO DE LEGALIDADE",
-                "enunciado": stmt,
-                "alternativas": alternativas,
-                "relatorio_integra": full_text,
-            }
-            log.info("  Extraída questão %d (fallback): %d chars", num,
-                     len(full_text))
-
-    # Return as ordered list following keep_numbers order
+    # Return ordered list
     ordered_keep = sorted(keep_numbers)
     final_list = [results[n] for n in ordered_keep if n in results]
     log.info(
-        "extract_questoes_from_relatorio: extraídas %d/%d questões pedidas (%s)",
+        "extract_questoes_from_relatorio: extraídas %d/%d questões pedidas (%s) | faltando: %s",
         len(final_list), len(keep_numbers),
-        sorted(results.keys())
+        sorted(results.keys()),
+        sorted(keep_numbers - set(results.keys()))
     )
     return final_list
+
+
+def _extract_from_resumos_section(paragraphs: list[str], keep_numbers: set[int]) -> list[dict]:
+    """Parse a 'Resumos' section where each entry is packed in one paragraph
+    with internal \\n breaks: 'QUESTÃO N — VÍCIO\\n Enunciado: ...\\n (A)... (B)...'
+    """
+    expanded_lines = []
+    for p in paragraphs:
+        for line in p.split("\n"):
+            line = line.strip()
+            if line:
+                expanded_lines.append(line)
+
+    results = {}
+    current_q = None
+    block_lines = []
+
+    def commit_block(num, lines):
+        if num is None or num not in keep_numbers:
+            return
+        full_text = "\n".join(lines).strip()
+        if not full_text:
+            return
+        header = lines[0] if lines else ""
+        header_match = re.match(
+            r"^QUEST[ÃA]O\s*0*(\d+)\s*[—\-–]+\s*(.*)$",
+            header,
+            re.IGNORECASE,
+        )
+        vicio = ""
+        if header_match:
+            vicio_full = header_match.group(2).strip()
+            vicio = re.sub(r"\([^)]*\)", "", vicio_full).strip()
+
+        enun_idx = None
+        for i, line in enumerate(lines):
+            if re.match(r"^enunciado\s*:", line, re.IGNORECASE):
+                enun_idx = i
+                break
+
+        alt_pattern = re.compile(r"^\(\s*([A-E])\s*\)\s*(.+?)\s*$")
+        alt_indices = []
+        alternativas = []
+        for i, line in enumerate(lines):
+            m = alt_pattern.match(line)
+            if m:
+                alt_indices.append(i)
+                letra = m.group(1)
+                alt_text = m.group(2).strip().strip('"').strip("”").strip("“")
+                alt_text = alt_text.rstrip(',').rstrip('.').strip()
+                alternativas.append(f"({letra}) {alt_text}")
+
+        enunciado = ""
+        if enun_idx is not None and alt_indices:
+            first_alt = alt_indices[0]
+            enun_lines = lines[enun_idx + 1: first_alt]
+            enun_inline = re.sub(r"^enunciado\s*:\s*", "", lines[enun_idx], flags=re.IGNORECASE)
+            if enun_inline:
+                enun_lines = [enun_inline] + enun_lines
+            enunciado = " ".join(enun_lines).strip().strip('"').strip("”").strip("“")
+            enunciado = re.sub(r"\s+", " ", enunciado)
+
+        fundamentacao = ""
+        if alt_indices:
+            last_alt = alt_indices[-1]
+            fund_lines = lines[last_alt + 1:]
+            fundamentacao = " ".join(fund_lines).strip()
+            fundamentacao = re.sub(r"\s+", " ", fundamentacao)
+
+        results[num] = {
+            "numero": num,
+            "vicio": vicio.upper() if vicio else "",
+            "enunciado": enunciado,
+            "alternativas": alternativas,
+            "relatorio_integra": fundamentacao or full_text,
+        }
+
+    for line in expanded_lines:
+        m = re.match(r"^QUEST[ÃA]O\s*0*(\d+)\s*[—\-–]+", line, re.IGNORECASE)
+        if m:
+            commit_block(current_q, block_lines)
+            current_q = int(m.group(1))
+            block_lines = [line]
+        else:
+            if current_q is not None:
+                block_lines.append(line)
+    commit_block(current_q, block_lines)
+
+    return list(results.values())
 
 
 def _filter_relatorio_questoes(docx_path: Path, keep_numbers: set[int]) -> bool:
@@ -1952,11 +2096,28 @@ Observações: {form_data.get('obs','')}""")
     # been unreliable. The relatório file is the source of truth.
     if ficha_estruturada and ficha_estruturada.get("questoes_anular") and docx_relatorios:
         keep_nums = _parse_question_numbers(ficha_estruturada["questoes_anular"])
+
+        # Determine the tipo_prova number (1-4) from the ficha
+        tipo_prova_num = None
+        tipo_prova_str = (ficha_estruturada.get("tipo_prova") or "").strip()
+        if tipo_prova_str:
+            m_tipo = re.search(r"\d+", tipo_prova_str)
+            if m_tipo:
+                tipo_prova_num = int(m_tipo.group(0))
+        log.info(
+            "Extraindo questões: pedidas=%s, tipo_prova_cliente=%s",
+            sorted(keep_nums), tipo_prova_num
+        )
+
         # Combine results from all relatório files
         all_extracted = []
         for rfile in docx_relatorios:
-            extracted = extract_questoes_from_relatorio(rfile, keep_nums)
+            log.info("Processando relatório: %s", rfile.name)
+            extracted = extract_questoes_from_relatorio(
+                rfile, keep_nums, tipo_prova_cliente=tipo_prova_num
+            )
             all_extracted.extend(extracted)
+
         # Dedupe by 'numero' keeping the longer 'relatorio_integra'
         by_num = {}
         for q in all_extracted:
@@ -1969,7 +2130,6 @@ Observações: {form_data.get('obs','')}""")
             data["questoes"] = [by_num[n] for n in sorted(by_num.keys())]
             faltando = sorted(keep_nums - set(by_num.keys()))
             if faltando:
-                # Add to dados_ausentes list
                 data.setdefault("dados_ausentes", []).append(
                     f"Relatório técnico das questões {faltando} ausente — manter texto do modelo nessas posições"
                 )
