@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 # ── VERSION MARKER — change this every release to confirm deploy ──────────
-APP_VERSION = "v32-2026-05-02-classificador-arquivos"
+APP_VERSION = "v33-2026-05-02-round2-desativado"
 log.info("=" * 70)
 log.info("🚀 SilvaPinto GeradorPeticoes %s INICIANDO", APP_VERSION)
 log.info("=" * 70)
@@ -827,6 +827,8 @@ def apply_substitutions(unpacked_dir: Path, data: dict, ficha: dict | None = Non
             "CARGO DISPUTADO NO CERTAME",
             "CARGO PRETENDIDO PELO CLIENTE",
             "CONFORME PREVISTO NO CRONOGRAMA OFICIAL",
+            "CONFORME CRONOGRAMA OFICIAL",
+            "CONFORME EDITAL",
         ]
         is_bad = any(marker.upper() in new_upper for marker in bad_markers)
         # Check if a generic substitute is being used to replace specific content.
@@ -840,6 +842,19 @@ def apply_substitutions(unpacked_dir: Path, data: dict, ficha: dict | None = Non
                         is_generic_replacement = True
                         break
 
+        # Catch the specific "X pontos" → "nota de corte" anti-pattern
+        # where the IA replaces a specific number with a generic phrase.
+        # Examples: "58 pontos" → "nota de corte"
+        if not is_bad and not is_generic_replacement:
+            if (re.match(r"^\d+\s+pontos?\s*$", old.strip(), re.IGNORECASE)
+                and "pontos" not in new.lower()
+                and not re.search(r"\d", new)):
+                log.warning(
+                    "Par #%d: substituiria valor numérico por texto sem números. Bloqueado.",
+                    pair_idx
+                )
+                is_generic_replacement = True
+
         if is_bad or is_generic_replacement:
             log.warning(
                 "Par #%d: 'substituir' contém marcador/genérico, pulando. "
@@ -850,6 +865,71 @@ def apply_substitutions(unpacked_dir: Path, data: dict, ficha: dict | None = Non
                 f"⚠️ Par com placeholder/genérico ignorado: '{old[:50]}' → '{new[:50]}'"
             )
             continue
+
+        # ── CONCURSO PROTECTION ──────────────────────────────────────────────
+        # If the ficha tells us the correct concurso state and institution,
+        # we must reject any pair that would CHANGE the correct value to a
+        # different state/institution. This prevents the IA from "fixing"
+        # the correct ES (concurso state) to MG (residence state) when the
+        # client lives in a different state from the concurso.
+        if ficha:
+            inst_correta = (ficha.get("instituicao_concurso") or "").strip()
+            sigla_correta = (ficha.get("sigla_concurso") or "").strip()
+            estado_correto = (ficha.get("estado_concurso") or "").strip()
+            uf_correta = (ficha.get("uf_concurso") or "").strip()
+
+            # Build a list of "correct" terms that must not be replaced
+            correct_terms = [t for t in [inst_correta, sigla_correta,
+                                          estado_correto, uf_correta] if t]
+            old_lower = old.lower()
+            new_lower = new.lower()
+
+            should_block = False
+            for term in correct_terms:
+                if term and term.lower() in old_lower:
+                    # The 'old' contains the CORRECT state/institution.
+                    # Check if 'new' has a DIFFERENT state/institution.
+                    if term.lower() not in new_lower:
+                        # The correct term was REMOVED in the substitution
+                        log.warning(
+                            "Par #%d: tentaria remover '%s' (correto da ficha) "
+                            "do texto. Bloqueado. buscar='%s', substituir='%s'",
+                            pair_idx, term, old[:60], new[:60]
+                        )
+                        should_block = True
+                        break
+            if should_block:
+                changes.append(
+                    f"⚠️ Par bloqueado (alteraria dado correto do concurso): "
+                    f"'{old[:50]}' → '{new[:50]}'"
+                )
+                continue
+
+            # Also block pairs that introduce wrong state/institution.
+            # If the residence UF differs from the concurso UF, the IA may
+            # try to "correct" PCES to PCMG based on residence — block it.
+            uf_residencia = (ficha.get("uf") or "").strip().upper()
+            if uf_correta and uf_residencia and uf_correta != uf_residencia:
+                # List of common wrong-state markers based on residence
+                wrong_markers = [
+                    f"PC{uf_residencia}", f"pc{uf_residencia.lower()}",
+                    f"Estado de {_uf_to_state_name(uf_residencia)}",
+                    f"ESTADO DE {_uf_to_state_name(uf_residencia).upper()}",
+                    f"Polícia Civil do Estado de {_uf_to_state_name(uf_residencia)}",
+                    f"POLÍCIA CIVIL DO ESTADO DE {_uf_to_state_name(uf_residencia).upper()}",
+                ]
+                if any(wm in new for wm in wrong_markers):
+                    log.warning(
+                        "Par #%d: introduziria estado de residência (%s) onde "
+                        "deveria estar o estado do concurso (%s). Bloqueado. "
+                        "buscar='%s', substituir='%s'",
+                        pair_idx, uf_residencia, uf_correta, old[:60], new[:60]
+                    )
+                    changes.append(
+                        f"⚠️ Par bloqueado (confundiu residência com concurso): "
+                        f"'{old[:50]}' → '{new[:50]}'"
+                    )
+                    continue
 
         log.info("Par #%d: buscando '%s' (len=%d)", pair_idx, old[:80], len(old))
 
@@ -2258,108 +2338,18 @@ Observações: {form_data.get('obs','')}""")
     # 6. Apply edits
     changes = apply_substitutions(unpacked_dir, data, ficha=ficha_estruturada)
 
-    # 6b. ROUND 2 REVIEW — extract current text, ask Claude what data is still old
-    try:
-        doc_xml_path = unpacked_dir / "word" / "document.xml"
-        if doc_xml_path.exists():
-            current_xml = doc_xml_path.read_text(encoding="utf-8")
-            current_text = re.sub(r"<[^>]+>", " ", current_xml)
-            current_text = re.sub(r"\s+", " ", current_text).strip()
-            current_text_limited = current_text[:200_000]
-
-            # Build authoritative client data block — prefer ficha values
-            auth_lines = ["DADOS CORRETOS DO CLIENTE (use EXATAMENTE estes valores):"]
-            if ficha_estruturada:
-                fe = ficha_estruturada
-                if fe.get("nome_cliente"):
-                    auth_lines.append(f"- Nome: {fe['nome_cliente']}")
-                if fe.get("comarca"):
-                    auth_lines.append(f"- Comarca: {fe['comarca']}")
-                if fe.get("banca"):
-                    auth_lines.append(f"- Banca: {fe['banca']}")
-                if fe.get("cargo"):
-                    auth_lines.append(f"- Cargo: {fe['cargo']}")
-                if fe.get("tipo_prova"):
-                    auth_lines.append(f"- Tipo de prova: {fe['tipo_prova']}")
-                if fe.get("pontuacao_obtida"):
-                    auth_lines.append(f"- Pontuação obtida: {fe['pontuacao_obtida']}")
-                if fe.get("pontuacao_final_calculada"):
-                    auth_lines.append(f"- Pontuação final após anulações: {fe['pontuacao_final_calculada']}")
-                if fe.get("nota_corte"):
-                    auth_lines.append(f"- Nota de corte: {fe['nota_corte']}")
-                if fe.get("questoes_anular"):
-                    auth_lines.append(f"- Questões a anular: {fe['questoes_anular']}")
-            cliente_novo = data.get("cliente", {})
-            if cliente_novo.get("rg"):
-                auth_lines.append(f"- RG: {cliente_novo['rg']}")
-            if cliente_novo.get("cpf"):
-                auth_lines.append(f"- CPF: {cliente_novo['cpf']}")
-            if cliente_novo.get("endereco"):
-                auth_lines.append(f"- Endereço: {cliente_novo['endereco']}, {cliente_novo.get('cidade','')}/{cliente_novo.get('uf','')}")
-
-            review_prompt = f"""{chr(10).join(auth_lines)}
-
-TAREFA: Analise o TEXTO DA PETIÇÃO abaixo. Identifique APENAS trechos que CONTRADIGAM
-diretamente os DADOS CORRETOS acima (ou seja, dados de outro cliente que ainda restaram).
-
-REGRAS RIGOROSAS:
-- Só gere par de substituição se o texto da petição contém um valor DIFERENTE do correto.
-- NÃO gere pares se o texto já está correto (mesmo que pareça simplificado).
-- NÃO gere pares para o cabeçalho de endereçamento já correto.
-- NÃO substitua valores corretos por valores semelhantes.
-- Se o texto está correto: retorne {{"substituicoes": []}}.
-- Cada par precisa ter "buscar" e "substituir" como strings NÃO VAZIAS.
-
-Para cada inconsistência ENCONTRADA, gere {{"buscar": "texto literal exato", "substituir": "valor correto"}}.
-
-Retorne APENAS JSON puro — sem markdown, sem ```, sem explicações.
-
-TEXTO DA PETIÇÃO ATUAL:
-{current_text_limited}"""
-
-            log.info("Round 2: enviando %d chars para revisão", len(review_prompt))
-            client = anthropic.Anthropic(api_key=api_key, timeout=300.0, max_retries=2)
-            review_msg = client.messages.create(
-                model="claude-sonnet-4-5",
-                max_tokens=32000,
-                system="Você é um revisor jurídico extremamente atento. Sua única tarefa é identificar inconsistências de dados entre uma petição editada e os dados corretos do cliente. Retorne APENAS JSON puro.",
-                messages=[{"role": "user", "content": review_prompt}]
-            )
-            review_raw = "".join(b.text for b in review_msg.content if hasattr(b, "text"))
-            log.info("Round 2 response: %d output tokens, raw preview: %s",
-                     review_msg.usage.output_tokens if review_msg.usage else 0,
-                     review_raw[:300])
-
-            try:
-                review_data = _parse_claude_json(review_raw)
-                review_pairs_raw = review_data.get("substituicoes", [])
-                # Filter out empty pairs
-                review_pairs = [
-                    p for p in review_pairs_raw
-                    if isinstance(p, dict)
-                    and p.get("buscar","").strip()
-                    and p.get("substituir","").strip()
-                    and p.get("buscar","").strip() != p.get("substituir","").strip()
-                ]
-                if review_pairs:
-                    log.info("Round 2: %d pares válidos adicionais para aplicar (de %d retornados)",
-                             len(review_pairs), len(review_pairs_raw))
-                    review_changes = apply_substitutions(
-                        unpacked_dir,
-                        {"substituicoes": review_pairs, "processo": {"gratuidade": True}},
-                        ficha=ficha_estruturada,
-                    )
-                    changes.extend(["📝 ROUND 2 (revisão automática):"] + review_changes)
-                else:
-                    log.info("Round 2: nenhum par válido (recebidos %d, todos vazios/idênticos)",
-                             len(review_pairs_raw))
-                    changes.append("✅ ROUND 2: nenhum dado antigo restante detectado")
-            except Exception as e:
-                log.warning("Round 2 review parse failed: %s. Raw: %s", e, review_raw[:500])
-                changes.append(f"⚠️ Round 2 falhou ao parsear: {e}")
-    except Exception as e:
-        log.warning("Round 2 skipped: %s", e)
-        changes.append(f"⚠️ Round 2 não executou: {e}")
+    # 6b. ROUND 2 DESATIVADO (v33+)
+    # Motivo: o Round 2 estava recebendo somente o texto da petição (sem o
+    # auth_block detalhado nem as regras), e tentava "consertar" coisas que já
+    # estavam corretas, gerando pares como:
+    #   - "POLÍCIA CIVIL DO ESTADO DO ESPÍRITO SANTO" → "...DE MINAS GERAIS"
+    #     (porque a residência do cliente é MG, mas o concurso é ES)
+    #   - "PCES" → "PCMG"
+    #   - "nota de corte" → "69 pontos" (inventado pela IA)
+    #   - pares para alterar headers de questões já reescritos pelo capítulo
+    # Como a v32+ já tem extração programática + auth_block forte no Round 1,
+    # o Round 2 perde valor e introduz instabilidade.
+    changes.append("ℹ️ Round 2 desativado nesta versão (causava instabilidade)")
 
     # 7. Repack
     safe_nome  = re.sub(r"[^\w\s]","",data.get("cliente",{}).get("nome_completo","Cliente")).replace(" ","_")
