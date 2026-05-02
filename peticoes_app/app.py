@@ -679,7 +679,26 @@ def apply_substitutions(unpacked_dir: Path, data: dict) -> list[str]:
     if not files_to_edit:
         return ["ERRO: nenhum XML editável encontrado"]
 
-    # Get find/replace pairs from Claude response
+    # ── STEP A: Rewrite "ROL DE QUESTÕES ILEGAIS" chapter FIRST ──────────────
+    # Important to do this BEFORE pair substitutions, so that pairs targeting
+    # old question text don't accidentally match new content (and vice-versa).
+    questoes = data.get("questoes", [])
+    if questoes:
+        doc_xml_path = unpacked_dir / "word" / "document.xml"
+        if doc_xml_path.exists():
+            xml = doc_xml_path.read_text(encoding="utf-8")
+            new_xml, n_replaced = _rewrite_questoes_chapter(xml, questoes)
+            if n_replaced > 0:
+                doc_xml_path.write_text(new_xml, encoding="utf-8")
+                changes.append(
+                    f"📜 Capítulo 'Rol de Questões Ilegais' reescrito com {len(questoes)} questões novas"
+                )
+            else:
+                changes.append(
+                    "ℹ️ Capítulo 'Rol de Questões Ilegais' não localizado para reescrita automática"
+                )
+
+    # ── STEP B: Apply find/replace pairs from Claude response ────────────────
     pairs = data.get("substituicoes", [])
     log.info("Total de substituições a aplicar: %d", len(pairs))
     if not pairs:
@@ -694,6 +713,18 @@ def apply_substitutions(unpacked_dir: Path, data: dict) -> list[str]:
             continue
         if old == new:
             log.info("Par #%d: buscar==substituir, pulando", pair_idx)
+            continue
+        # CRITICAL SAFETY: if 'old' is contained in 'new', applying repeatedly
+        # would cause an infinite loop appending the same content forever.
+        if old in new:
+            log.warning(
+                "Par #%d: 'buscar' está contido em 'substituir' — par recursivo, "
+                "pulando para evitar loop. buscar='%s', substituir='%s'",
+                pair_idx, old[:60], new[:60]
+            )
+            changes.append(
+                f"⚠️ Par recursivo ignorado (geraria loop): '{old[:60]}' → '{new[:60]}'"
+            )
             continue
 
         log.info("Par #%d: buscando '%s' (len=%d)", pair_idx, old[:80], len(old))
@@ -756,19 +787,6 @@ def apply_substitutions(unpacked_dir: Path, data: dict) -> list[str]:
                 xml_path.write_text(new_xml, encoding="utf-8")
                 changes.append("🗑️ Capítulo de gratuidade removido")
                 break
-
-    # Rewrite "ROL DE QUESTÕES ILEGAIS" chapter using IA-provided question data
-    questoes = data.get("questoes", [])
-    if questoes:
-        doc_xml_path = unpacked_dir / "word" / "document.xml"
-        if doc_xml_path.exists():
-            xml = doc_xml_path.read_text(encoding="utf-8")
-            new_xml, n_replaced = _rewrite_questoes_chapter(xml, questoes)
-            if n_replaced > 0:
-                doc_xml_path.write_text(new_xml, encoding="utf-8")
-                changes.append(f"📜 Capítulo 'Rol de Questões Ilegais' reescrito com {len(questoes)} questões novas")
-            else:
-                changes.append("ℹ️ Capítulo 'Rol de Questões Ilegais' não localizado para reescrita automática")
 
     return changes
 
@@ -868,8 +886,11 @@ def _rewrite_questoes_chapter(xml: str, questoes: list) -> tuple[str, int]:
     for q in questoes:
         numero = q.get("numero", "?")
         vicio  = q.get("vicio", "VÍCIO NÃO ESPECIFICADO")
-        resumo = q.get("resumo_peticao", "")
-        # Escape XML special chars
+        enunciado = q.get("enunciado", "")
+        alternativas = q.get("alternativas", []) or []
+        relatorio = q.get("relatorio_integra") or q.get("resumo_peticao", "")
+
+        # Header: QUESTÃO N — VÍCIO
         new_blocks_xml += (
             f'<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
             f'<w:pPr><w:spacing w:before="240" w:after="120"/></w:pPr>'
@@ -877,13 +898,39 @@ def _rewrite_questoes_chapter(xml: str, questoes: list) -> tuple[str, int]:
             f'<w:t xml:space="preserve">QUESTÃO {xe(str(numero))} — {xe(str(vicio))}</w:t>'
             f'</w:r></w:p>'
         )
-        if resumo:
+
+        # Enunciado (single paragraph with command + statement)
+        if enunciado:
             new_blocks_xml += (
                 f'<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
                 f'<w:pPr><w:jc w:val="both"/></w:pPr>'
-                f'<w:r><w:t xml:space="preserve">{xe(resumo)}</w:t></w:r>'
+                f'<w:r><w:t xml:space="preserve">{xe(enunciado)}</w:t></w:r>'
                 f'</w:p>'
             )
+
+        # Alternativas (one per line)
+        for alt in alternativas:
+            if alt:
+                new_blocks_xml += (
+                    f'<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                    f'<w:pPr><w:ind w:left="567"/></w:pPr>'
+                    f'<w:r><w:t xml:space="preserve">{xe(str(alt))}</w:t></w:r>'
+                    f'</w:p>'
+                )
+
+        # Fundamentação completa (preferable over short summary)
+        if relatorio:
+            # Split by paragraphs if it has line breaks
+            for paragraph in str(relatorio).split("\n"):
+                paragraph = paragraph.strip()
+                if not paragraph:
+                    continue
+                new_blocks_xml += (
+                    f'<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                    f'<w:pPr><w:jc w:val="both"/></w:pPr>'
+                    f'<w:r><w:t xml:space="preserve">{xe(paragraph)}</w:t></w:r>'
+                    f'</w:p>'
+                )
 
     # Replace chapter content (between heading end and next chapter start)
     new_xml = xml[:p_end_marker] + new_blocks_xml + xml[end_of_chapter_in_xml:]
@@ -1476,11 +1523,27 @@ Observações: {form_data.get('obs','')}""")
         full_relat = read_docx_text(fpath, max_chars=200_000)
         parts.append(
             f"\n=== RELATÓRIO TÉCNICO DAS QUESTÕES — arquivo: {rname} ===\n"
-            f"Identifique cada questão (pelo número), seu vício e a fundamentação.\n"
-            f"Para CADA questão na lista 'QUESTÕES A ANULAR' da ficha, gere um par\n"
-            f"de substituição que troque o resumo da questão antiga (do modelo) pelo\n"
-            f"resumo da questão nova (deste relatório).\n"
-            f"Em 'questoes' do JSON, popule número, vício, resumo_peticao, enunciado e relatorio_integra.\n\n"
+            f"Este arquivo contém os pareceres técnicos de várias questões, mas você\n"
+            f"deve usar APENAS as questões que estão na lista 'QUESTÕES A ANULAR' da ficha.\n"
+            f"\n"
+            f"INSTRUÇÕES PARA POPULAR O ARRAY 'questoes' DO JSON:\n"
+            f"1. Para CADA questão da lista da ficha, localize o parecer correspondente\n"
+            f"   neste relatório (procure por 'Questão N', 'PARECER QUESTÃO N', etc.).\n"
+            f"2. Se o relatório tiver um tópico final 'RESUMOS' ou 'SÍNTESE' (geralmente\n"
+            f"   no final do arquivo, com todos os enunciados + fundamentações compactos),\n"
+            f"   USE PREFERENCIALMENTE essa versão para o campo 'relatorio_integra' —\n"
+            f"   ela já vem otimizada para a petição inicial.\n"
+            f"3. Caso contrário, use o parecer técnico completo da questão.\n"
+            f"4. Para cada questão, popule:\n"
+            f"   - numero, vicio (palavras-chave em CAIXA ALTA)\n"
+            f"   - enunciado: comando + texto da questão num único parágrafo\n"
+            f"   - alternativas: lista A/B/C/D/E\n"
+            f"   - relatorio_integra: a fundamentação (do tópico Resumos, se existir)\n"
+            f"5. Se uma questão da lista da ficha NÃO estiver no relatório, adicione-a\n"
+            f"   ao array 'dados_ausentes' como 'Relatório técnico da questão N ausente'.\n"
+            f"\n"
+            f"NÃO gere pares de 'substituicoes' para os blocos das questões — o sistema\n"
+            f"reescreve esse capítulo automaticamente usando o array 'questoes'.\n\n"
             f"{full_relat}"
         )
 
@@ -1489,28 +1552,30 @@ Observações: {form_data.get('obs','')}""")
     parts.append(
         f"\n=== MODELO DA PETIÇÃO (texto integral) — arquivo: {docx_model.name} ===\n"
         f"Identifique TODOS os trechos que se referem ao CLIENTE ANTIGO\n"
-        f"(nome, RG, CPF, endereço, pontuação, banca, cargo, comarca, questões, etc.)\n"
-        f"e gere pares de 'buscar' (texto antigo) → 'substituir' (valor correto da ficha).\n\n"
-        f"⚠️ ATENÇÃO ESPECIAL — CAPÍTULO DAS QUESTÕES ANULÁVEIS:\n"
-        f"O modelo possui um capítulo (geralmente intitulado 'DAS QUESTÕES ILEGAIS',\n"
-        f"'DA ILEGALIDADE DAS QUESTÕES' ou similar) com BLOCOS INDIVIDUAIS para cada\n"
-        f"questão antiga (ex: 'QUESTÃO 10 — ERRO GROSSEIRO', 'QUESTÃO 25 — ...').\n"
-        f"Você DEVE gerar pares de substituição para CADA bloco antigo, trocando-o\n"
-        f"pelo bloco correspondente da QUESTÃO NOVA do RELATÓRIO TÉCNICO.\n"
-        f"Exemplo:\n"
-        f"  buscar: 'QUESTÃO 10 — ERRO GROSSEIRO\\n[texto longo da questão antiga]'\n"
-        f"  substituir: 'QUESTÃO 1 — ERRO GROSSEIRO\\n[texto da questão nova baseado no relatório técnico]'\n"
+        f"(nome, RG, CPF, endereço, pontuação, banca, cargo, comarca, etc.)\n"
+        f"e gere pares de 'buscar' (texto antigo) → 'substituir' (valor correto da ficha).\n"
         f"\n"
-        f"REGRA: O número de questões na petição final DEVE ser EXATAMENTE o número\n"
-        f"de questões listadas em 'QUESTÕES A ANULAR' da ficha do cliente.\n"
-        f"Se a ficha lista 6 questões e o modelo tem 4, você DEVE gerar pares para\n"
-        f"trocar todas as 4 antigas pelas 4 primeiras novas, e ADICIONAR pares para\n"
-        f"inserir as 2 questões novas restantes (use um marcador como\n"
-        f"'\\nQUESTÃO_NOVA_INSERIDA: número | vício | resumo' que o sistema processará).\n"
+        f"⚠️ NÃO gere pares de substituição para os BLOCOS DE QUESTÕES no capítulo\n"
+        f"'DO ROL DE QUESTÕES ILEGAIS' (ou equivalente). O sistema vai reescrever\n"
+        f"esse capítulo automaticamente usando os dados do array 'questoes' do JSON.\n"
         f"\n"
-        f"⚠️ TAMBÉM no rol de pedidos finais, identifique a lista numérica das questões\n"
-        f"a anular (ex: 'declarar a nulidade das questões 10, 25, 31 e 34') e gere\n"
-        f"par de substituição com os números novos.\n\n"
+        f"Sua tarefa para as questões é APENAS popular o array 'questoes' com:\n"
+        f"  - numero: número da questão (conforme a ficha)\n"
+        f"  - vicio: tipo do vício (ERRO GROSSEIRO, EXTRAPOLAÇÃO DO EDITAL, etc.)\n"
+        f"  - enunciado: comando + enunciado da questão num único parágrafo\n"
+        f"  - alternativas: lista das alternativas (A, B, C, D, E)\n"
+        f"  - relatorio_integra: a fundamentação COMPLETA da questão extraída\n"
+        f"    do RELATÓRIO TÉCNICO (não invente — use o texto real do relatório).\n"
+        f"\n"
+        f"⚠️ APENAS no rol de pedidos finais (frase tipo 'declarar a nulidade das\n"
+        f"questões impugnadas 10, 25, 31 e 34'), você deve sim gerar par de\n"
+        f"substituição com os números novos da ficha do cliente.\n"
+        f"\n"
+        f"⚠️ REGRA ANTI-RECURSÃO: NUNCA gere um par onde 'buscar' está contido\n"
+        f"dentro de 'substituir'. Exemplo PROIBIDO:\n"
+        f"  buscar: 'PCES'\n"
+        f"  substituir: 'PCES (informação adicional)'\n"
+        f"O sistema rejeita pares assim por causarem loop infinito de substituições.\n\n"
         f"{modelo_text}"
     )
 
