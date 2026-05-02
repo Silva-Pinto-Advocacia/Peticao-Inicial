@@ -225,31 +225,72 @@ e gerar um JSON estruturado para preenchimento da Petição Inicial em modelo .d
 
 ═══ SUBSTITUIÇÃO DOS DADOS DO CLIENTE NO MODELO ═══
 
+ATENÇÃO MÁXIMA: Esta é a tarefa MAIS CRÍTICA da sua função.
 O modelo da petição vem com dados de um CLIENTE ANTIGO escritos diretamente no texto.
-Sua tarefa MAIS IMPORTANTE é identificar todos esses trechos e gerar pares
+Você DEVE identificar TODOS esses trechos sem exceção e gerar pares
 "buscar → substituir" para que o sistema faça a troca automaticamente.
 
-Inclua no array "substituicoes" do JSON pares para TODOS os dados que mudam, como:
-- Nome completo do cliente antigo → nome do cliente novo
-- Estado civil, profissão, RG, CPF do cliente antigo → do novo
-- Endereço completo do cliente antigo → endereço novo
-- Pontuação obtida (ex: "55 pontos") → pontuação real do novo cliente
-- Pontuação após anulação (ex: "59 pts") → pontuação projetada do novo cliente
-- Nota de corte se diferente (ex: "58 pontos") → nota de corte real
-- Comarca (ex: "BARRA DE SÃO FRANCISCO/ES") → comarca do novo cliente
-- Cargo (ex: "Oficial Investigador de Polícia") → cargo se diferente
-- Banca examinadora se diferente
-- Tipo de prova (ex: "Prova Tipo 2") → tipo de prova do novo cliente
-- Números de questões antigas (ex: "questões 10, 25, 31 e 34") → questões reais
-- Quaisquer outros dados específicos do caso antigo
+TIPOS DE DADOS QUE PRECISAM SER SUBSTITUÍDOS (lista NÃO exaustiva — identifique tudo):
 
-REGRAS PARA OS PARES:
-- "buscar": deve ser TEXTO LITERAL exato do modelo (copie como aparece, com
-  acentos, maiúsculas e pontuação iguais).
-- "substituir": deve ser o texto novo correspondente.
-- Inclua o suficiente do contexto para ser único (evite buscar palavras isoladas).
-- Use múltiplos pares pequenos em vez de um só gigante (mais fácil de localizar).
-- Se um dado se repete no modelo, basta UM par — o sistema substitui todas as ocorrências.
+1. QUALIFICAÇÃO PESSOAL DO CLIENTE
+   - Nome completo (em TODAS as ocorrências, inclusive em letras maiúsculas)
+   - Estado civil (ex: "Casado", "Solteira")
+   - Profissão (ex: "desempregado", "policial militar")
+   - Número do RG (ex: "339924-4")
+   - Número do CPF (ex: "140.948.387-83")
+   - E-mail
+   - Endereço completo (rua, número, bairro, complemento)
+   - Cidade e UF
+   - CEP
+
+2. DADOS DO CONCURSO
+   - Nome do concurso e edital (ex: "Edital nº 01/2025 — PCES")
+   - Cargo pretendido (ex: "Oficial Investigador de Polícia")
+   - Banca examinadora (ex: "IBADE", "FGV", "AOCP")
+   - Tipo de prova realizada (ex: "Prova Tipo 2")
+   - Datas das etapas
+
+3. PONTUAÇÃO E CLASSIFICAÇÃO
+   - Pontuação obtida pelo cliente antigo (ex: "55 pontos", "55 pts")
+   - Pontuação após anulação (ex: "59 pts", "59 pontos")
+   - Nota de corte (ex: "58 pontos") — se diferente para o novo cliente
+   - Quaisquer outros números relacionados à pontuação
+
+4. JURISDIÇÃO E PARTES
+   - Comarca de endereçamento (ex: "BARRA DE SÃO FRANCISCO/ES")
+   - Estado/UF que compõe o polo passivo
+   - Tipo de ação (se diferente)
+
+5. QUESTÕES IMPUGNADAS
+   - Lista de números das questões antigas (ex: "questões 10, 25, 31 e 34")
+   - Substituir pela lista das questões reais do novo cliente
+
+REGRAS OBRIGATÓRIAS PARA OS PARES:
+
+✅ PARES GRANULARES: Crie um par por dado individual em vez de um par gigante.
+   - BOM: {"buscar": "ADLER MARQUES DE LIMA", "substituir": "JOÃO DA SILVA"}
+   - BOM: {"buscar": "140.948.387-83", "substituir": "111.222.333-44"}
+   - BOM: {"buscar": "55 pontos", "substituir": "60 pontos"}
+   - RUIM: {"buscar": "ADLER MARQUES DE LIMA, Casado, desempregado, RG 339924-4...",
+            "substituir": "JOÃO DA SILVA, Solteiro, professor, RG 555..."}
+
+✅ TEXTO LITERAL: copie EXATAMENTE como aparece no modelo (acentos, maiúsculas,
+   pontuação, espaços). Se aparece "ADLER MARQUES DE LIMA" em maiúsculas,
+   crie um par com texto em maiúsculas. Se aparece "Adler Marques de Lima"
+   em outro lugar, crie OUTRO par para essa variação.
+
+✅ BUSQUE TODAS AS OCORRÊNCIAS: percorra o modelo inteiro mentalmente e
+   procure cada dado em CADA seção (cabeçalho, qualificação, fatos, pontuação,
+   pedidos, etc.). NUNCA assuma que substituir uma vez resolve tudo —
+   se o sistema vai trocar todas as ocorrências de uma string, mas se o nome
+   aparece em formatos diferentes (maiúsculo, minúsculo, abreviado), cada
+   formato precisa de seu próprio par.
+
+✅ NÃO INCLUA DUPLICATAS: se a string idêntica aparece 5 vezes, basta UM par.
+
+✅ MÍNIMO 15 PARES: para um modelo típico de petição de concurso, você deve
+   gerar AO MENOS 15-25 pares de substituição. Se gerar menos de 10, é sinal
+   de que está deixando dados antigos passar.
 
 JSON PURO (sem markdown, sem backticks, sem texto antes ou depois).
 REGRAS CRÍTICAS PARA O JSON:
@@ -441,42 +482,64 @@ def apply_substitutions(unpacked_dir: Path, data: dict) -> list[str]:
 
     # Get find/replace pairs from Claude response
     pairs = data.get("substituicoes", [])
+    log.info("Total de substituições a aplicar: %d", len(pairs))
     if not pairs:
         changes.append("⚠️ Nenhum par de substituição retornado pelo Claude")
 
     # Apply each pair across all XML files
-    for pair in pairs:
+    for pair_idx, pair in enumerate(pairs):
         old = pair.get("buscar", "").strip()
         new = pair.get("substituir", "").strip()
-        if not old or old == new:
+        if not old:
+            log.warning("Par #%d: 'buscar' vazio, pulando", pair_idx)
             continue
+        if old == new:
+            log.info("Par #%d: buscar==substituir, pulando", pair_idx)
+            continue
+
+        log.info("Par #%d: buscando '%s' (len=%d)", pair_idx, old[:80], len(old))
 
         old_xe = xe(old)
         new_xe = xe(new)
         total_count = 0
+        method_used = ""
 
         for xml_path in files_to_edit:
             xml = xml_path.read_text(encoding="utf-8")
+            file_count = 0
 
-            # Try literal XML-escaped match first
+            # Method 1: literal XML-escaped match
             count = xml.count(old_xe)
             if count > 0:
                 xml = xml.replace(old_xe, new_xe)
-                total_count += count
+                file_count += count
+                method_used = "literal"
                 xml_path.write_text(xml, encoding="utf-8")
-                continue
 
-            # Fallback: try matching across XML run boundaries
-            # Word splits text into <w:t>...</w:t> chunks; reconstruct visible text
-            new_xml = _replace_across_runs(xml, old, new)
-            if new_xml != xml:
-                xml_path.write_text(new_xml, encoding="utf-8")
-                total_count += 1
+            # Method 2: cross-run replacement (loop until no more matches)
+            else:
+                attempts = 0
+                while attempts < 20:  # safety limit
+                    new_xml = _replace_across_runs(xml, old, new)
+                    if new_xml == xml:
+                        break
+                    xml = new_xml
+                    file_count += 1
+                    attempts += 1
+                    method_used = "cross-run"
+                if file_count > 0:
+                    xml_path.write_text(xml, encoding="utf-8")
+
+            total_count += file_count
+            if file_count > 0:
+                log.info("  %s: %d replacement(s) via %s",
+                         xml_path.name, file_count, method_used)
 
         if total_count > 0:
-            changes.append(f"✅ '{old[:40]}...' → '{new[:40]}...' ({total_count}x)")
+            changes.append(f"✅ [{method_used}] '{old[:50]}' → '{new[:50]}' ({total_count}x)")
         else:
-            changes.append(f"⚠️ Não encontrado: '{old[:60]}...'")
+            log.warning("  Não encontrado em nenhum arquivo: '%s'", old[:80])
+            changes.append(f"⚠️ Não encontrado: '{old[:60]}'")
 
     # Remove gratuidade chapter if not applicable
     p = data.get("processo", {})
@@ -494,8 +557,6 @@ def apply_substitutions(unpacked_dir: Path, data: dict) -> list[str]:
 
 def _replace_across_runs(xml: str, old: str, new: str) -> str:
     """Try to replace text that may be split across multiple <w:t> elements."""
-    # Build a map of positions where text would render
-    # Strategy: find the visible text, locate it, and replace at the run level
     if not old:
         return xml
 
@@ -507,46 +568,88 @@ def _replace_across_runs(xml: str, old: str, new: str) -> str:
 
     # Build concatenated text and position map
     concat = ""
-    positions = []  # (start_in_concat, end_in_concat, match_idx)
+    positions = []
     for i, m in enumerate(matches):
         text = m.group(1)
         start = len(concat)
         concat += text
         positions.append((start, start + len(text), i))
 
-    # Find old text in concatenated visible text
+    # Try direct find first
     idx = concat.find(old)
-    if idx < 0:
-        return xml
 
-    end_idx = idx + len(old)
+    # Whitespace-tolerant fallback: collapse whitespace in both
+    if idx < 0:
+        norm_old = re.sub(r"\s+", " ", old).strip()
+        norm_concat = re.sub(r"\s+", " ", concat).strip()
+        if norm_old in norm_concat:
+            # Find the actual range in concat by walking char by char
+            # building a normalized version while tracking original positions
+            def find_norm(haystack: str, needle: str):
+                """Returns (start_in_haystack, end_in_haystack) for a whitespace-normalised match."""
+                # Build mapping of original_index -> normalized_index
+                norm_chars = []
+                orig_indices = []
+                last_was_space = True
+                for i, ch in enumerate(haystack):
+                    if ch.isspace():
+                        if not last_was_space:
+                            norm_chars.append(" ")
+                            orig_indices.append(i)
+                            last_was_space = True
+                    else:
+                        norm_chars.append(ch)
+                        orig_indices.append(i)
+                        last_was_space = False
+                norm_str = "".join(norm_chars).strip()
+                # Find needle (also normalised)
+                n_idx = norm_str.find(needle)
+                if n_idx < 0:
+                    return None
+                # Account for leading whitespace stripped
+                leading_strip = len(norm_str) - len(norm_str.lstrip()) if False else 0
+                # Map back to original
+                start_orig = orig_indices[n_idx] if n_idx < len(orig_indices) else None
+                end_norm   = n_idx + len(needle) - 1
+                end_orig   = orig_indices[end_norm] + 1 if end_norm < len(orig_indices) else len(haystack)
+                return (start_orig, end_orig)
+
+            result = find_norm(concat, norm_old)
+            if result:
+                idx, end_idx_calc = result
+            else:
+                return xml
+        else:
+            return xml
+    else:
+        end_idx_calc = idx + len(old)
+
+    end_idx = end_idx_calc
 
     # Identify runs that overlap [idx, end_idx)
     affected = [(s, e, i) for (s, e, i) in positions if not (e <= idx or s >= end_idx)]
     if not affected:
         return xml
 
-    # Build new XML: replace text in first affected run with new value,
-    # blank out other affected runs
+    affected_idxs = [a[2] for a in affected]
+    first_affected = affected[0][2]
+
+    # Build new XML
     new_xml_parts = []
     last_pos = 0
     for j, m in enumerate(matches):
         new_xml_parts.append(xml[last_pos:m.start()])
-        affected_idxs = [a[2] for a in affected]
-        if j == affected[0][2]:
-            # First affected: write the prefix + new value + suffix
+        if j == first_affected:
             run_start, run_end, _ = positions[j]
             prefix = m.group(1)[:max(0, idx - run_start)]
             suffix = m.group(1)[max(0, end_idx - run_start):] if run_end > end_idx else ""
             new_text = prefix + new + suffix
             new_xml_parts.append(f'<w:t xml:space="preserve">{xe(new_text)}</w:t>')
         elif j in affected_idxs:
-            # Other affected runs: keep tag but empty text
             run_start, run_end, _ = positions[j]
             if run_end <= end_idx:
                 new_xml_parts.append('<w:t xml:space="preserve"></w:t>')
             else:
-                # Partial: keep what's after end_idx
                 suffix = m.group(1)[end_idx - run_start:]
                 new_xml_parts.append(f'<w:t xml:space="preserve">{xe(suffix)}</w:t>')
         else:
