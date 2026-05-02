@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 # ── VERSION MARKER — change this every release to confirm deploy ──────────
-APP_VERSION = "v35-2026-05-02-pares-auto-ementa-questoes"
+APP_VERSION = "v36-2026-05-02-pontuacao-variacoes"
 log.info("=" * 70)
 log.info("🚀 SilvaPinto GeradorPeticoes %s INICIANDO", APP_VERSION)
 log.info("=" * 70)
@@ -314,6 +314,33 @@ _UF_TO_STATE = {
 
 def _uf_to_state_name(uf: str) -> str:
     return _UF_TO_STATE.get((uf or "").upper(), uf or "")
+
+
+def _num_extenso(n: int) -> str:
+    """Portuguese cardinal number 0-200 in words.
+
+    Used to generate substitution pairs for legal-text patterns like
+    '55 (cinquenta e cinco) pontos' that the IA often misses.
+    """
+    if not isinstance(n, int) or not (0 <= n <= 200):
+        return str(n)
+    units = ["zero", "um", "dois", "três", "quatro", "cinco", "seis", "sete",
+             "oito", "nove", "dez", "onze", "doze", "treze", "quatorze",
+             "quinze", "dezesseis", "dezessete", "dezoito", "dezenove"]
+    tens = ["", "", "vinte", "trinta", "quarenta", "cinquenta",
+            "sessenta", "setenta", "oitenta", "noventa"]
+    if n < 20:
+        return units[n]
+    if n < 100:
+        d, u = divmod(n, 10)
+        return tens[d] if u == 0 else f"{tens[d]} e {units[u]}"
+    if n == 100:
+        return "cem"
+    if n < 200:
+        return f"cento e {_num_extenso(n - 100)}"
+    if n == 200:
+        return "duzentos"
+    return str(n)
 
 
 
@@ -818,6 +845,92 @@ def apply_substitutions(unpacked_dir: Path, data: dict, ficha: dict | None = Non
                                 })
                                 log.info(
                                     "Sistema gerou par automático ementa: '%s' → '%s'",
+                                    old_phrase, new_phrase
+                                )
+
+        # ── AUTO-PAIRS: variações de pontuação ('X pontos', 'X pts', 'X (extenso) pontos') ──
+        # The IA often generates "55 pontos" → "66 pontos" but misses other forms
+        # like "55 pts" or "55 (cinquenta e cinco) pontos". This block finds all
+        # numeric scores in the model (0-100 range) and, for those that DO NOT
+        # match the new ficha values, generates substitution pairs covering
+        # common Portuguese legal-text variations.
+        if pont_obtida and pont_final:
+            try:
+                obt_int = int(float(str(pont_obtida).replace(",", ".").split()[0]))
+                fin_int = int(float(str(pont_final).replace(",", ".").split()[0]))
+            except (ValueError, IndexError):
+                obt_int = fin_int = None
+
+            if obt_int is not None and fin_int is not None:
+                doc_xml_path = unpacked_dir / "word" / "document.xml"
+                if doc_xml_path.exists():
+                    xml_now = doc_xml_path.read_text(encoding="utf-8")
+                    text_now = re.sub(r"<[^>]+>", " ", xml_now)
+                    text_now = re.sub(r"\s+", " ", text_now)
+
+                    # Find all distinct numeric scores in pattern "N pontos" or "N pts" (0-100)
+                    score_pat = re.compile(
+                        r"\b(\d{1,3})\s*(?:\(([^)]+)\)\s*)?(pontos?|pts?)\b",
+                        re.IGNORECASE,
+                    )
+                    seen_scores = set()
+                    for m in score_pat.finditer(text_now):
+                        try:
+                            n = int(m.group(1))
+                        except ValueError:
+                            continue
+                        if not (0 <= n <= 100):
+                            continue
+                        # If already correct (matches ficha), skip
+                        if n == obt_int or n == fin_int:
+                            continue
+                        seen_scores.add(n)
+
+                    # For each old score, decide if it maps to obt_int or fin_int.
+                    # Heuristic: the smaller old score → obt_int (current),
+                    # the larger old score → fin_int (after anulações).
+                    # If only one old score, map to obt_int (most common case).
+                    sorted_old = sorted(seen_scores)
+                    mapping = {}
+                    if len(sorted_old) >= 2:
+                        # Smaller → pontuação obtida atual; maior → final calculada
+                        mapping[sorted_old[0]] = obt_int
+                        mapping[sorted_old[-1]] = fin_int
+                        # Middle values get mapped to obt_int (conservative)
+                        for n in sorted_old[1:-1]:
+                            mapping[n] = obt_int
+                    elif len(sorted_old) == 1:
+                        mapping[sorted_old[0]] = obt_int
+
+                    # Generate variation pairs for each mapping
+                    for old_n, new_n in mapping.items():
+                        old_ext = _num_extenso(old_n)
+                        new_ext = _num_extenso(new_n)
+                        # Variations to cover common forms in legal text.
+                        # Each variation: (template_old, template_new)
+                        variations = [
+                            # "55 pontos" → "66 pontos"
+                            (f"{old_n} pontos", f"{new_n} pontos"),
+                            (f"{old_n} ponto", f"{new_n} pontos"),
+                            (f"{old_n} pts", f"{new_n} pts"),
+                            (f"{old_n} pt", f"{new_n} pts"),
+                            # "55 (cinquenta e cinco) pontos" → "66 (sessenta e seis) pontos"
+                            (f"{old_n} ({old_ext}) pontos", f"{new_n} ({new_ext}) pontos"),
+                            (f"{old_n} ({old_ext}) ponto",  f"{new_n} ({new_ext}) pontos"),
+                            (f"{old_n} ({old_ext}) pts",    f"{new_n} ({new_ext}) pts"),
+                            # Caps versions
+                            (f"{old_n} PONTOS", f"{new_n} PONTOS"),
+                            (f"{old_n} PTS",    f"{new_n} PTS"),
+                            (f"{old_n} ({old_ext.upper()}) PONTOS", f"{new_n} ({new_ext.upper()}) PONTOS"),
+                        ]
+                        for old_phrase, new_phrase in variations:
+                            if old_phrase in text_now and old_phrase != new_phrase:
+                                pairs.insert(0, {
+                                    "buscar": old_phrase,
+                                    "substituir": new_phrase,
+                                })
+                                log.info(
+                                    "Sistema gerou par automático pontuação: '%s' → '%s'",
                                     old_phrase, new_phrase
                                 )
 
