@@ -168,7 +168,16 @@ SUAS RESPONSABILIDADES:
 8. Verificar se a comarca está correta conforme domicílio do cliente.
 9. Sinalizar campos ausentes com [DADO AUSENTE — descrição].
 
-FORMATO DE RESPOSTA — JSON PURO (sem markdown, sem backticks, sem texto antes ou depois):
+FORMATO DE RESPOSTA — JSON PURO (sem markdown, sem backticks, sem texto antes ou depois).
+REGRAS CRÍTICAS PARA O JSON:
+- Use APENAS aspas duplas para strings, nunca aspas simples ou aspas tipográficas (" ").
+- Dentro de strings, escape quebras de linha como \n (nunca quebra de linha real).
+- Dentro de strings, escape aspas duplas como \".
+- NÃO inclua vírgulas após o último item de objetos ou arrays.
+- Não use comentários no JSON.
+- Antes de responder, mentalmente valide a sintaxe do JSON.
+
+Schema:
 {
   "cliente": {
     "nome_completo": "",
@@ -224,6 +233,78 @@ FORMATO DE RESPOSTA — JSON PURO (sem markdown, sem backticks, sem texto antes 
 
 # ── Claude call ───────────────────────────────────────────────────────────────
 
+def _parse_claude_json(raw: str) -> dict:
+    """Robustly parse JSON from Claude's response, handling common malformations."""
+    # Strip markdown fences
+    raw = re.sub(r"```json\s*", "", raw)
+    raw = re.sub(r"```\s*", "", raw)
+    raw = raw.strip()
+
+    # Extract just the JSON object — find the outermost { ... }
+    start = raw.find("{")
+    end   = raw.rfind("}")
+    if start >= 0 and end > start:
+        raw = raw[start:end+1]
+
+    # First attempt: parse as-is
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e1:
+        log.warning("JSON decode failed at first try: %s", e1)
+
+    # Second attempt: fix common issues
+    fixed = raw
+    # Remove trailing commas before } or ]
+    fixed = re.sub(r",(\s*[}\]])", r"\1", fixed)
+    # Replace smart quotes that may have leaked in
+    fixed = fixed.replace("\u201c", '"').replace("\u201d", '"')
+    fixed = fixed.replace("\u2018", "'").replace("\u2019", "'")
+    # Newlines inside strings — most common cause of "Expecting ',' delimiter"
+    # is unescaped newlines in JSON string values. Try escaping them.
+    try:
+        return json.loads(fixed)
+    except json.JSONDecodeError as e2:
+        log.warning("JSON decode failed at second try: %s", e2)
+
+    # Third attempt: aggressive — try to fix unescaped newlines inside strings
+    # by parsing line-by-line and joining quoted strings
+    try:
+        # Replace literal newlines inside quoted strings with \\n
+        result = []
+        in_string = False
+        escape = False
+        for ch in fixed:
+            if escape:
+                result.append(ch)
+                escape = False
+                continue
+            if ch == "\\":
+                result.append(ch)
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                result.append(ch)
+                continue
+            if in_string and ch == "\n":
+                result.append("\\n")
+                continue
+            if in_string and ch == "\r":
+                result.append("\\r")
+                continue
+            if in_string and ch == "\t":
+                result.append("\\t")
+                continue
+            result.append(ch)
+        fixed = "".join(result)
+        return json.loads(fixed)
+    except json.JSONDecodeError as e3:
+        log.error("All JSON parse attempts failed. Last error: %s", e3)
+        log.error("Raw content (first 500 chars): %s", raw[:500])
+        log.error("Raw content (last 500 chars): %s", raw[-500:])
+        raise
+
+
 def call_claude(api_key: str, full_text: str) -> dict:
     """Single text-only call to Claude. No PDFs, no binary — pure text."""
     # 5-minute timeout: longer than gunicorn's, so Claude has time to respond
@@ -239,9 +320,7 @@ def call_claude(api_key: str, full_text: str) -> dict:
              message.usage.input_tokens if message.usage else 0,
              message.usage.output_tokens if message.usage else 0)
     raw = "".join(b.text for b in message.content if hasattr(b, "text"))
-    raw = re.sub(r"```json\s*", "", raw)
-    raw = re.sub(r"```\s*", "", raw)
-    return json.loads(raw.strip())
+    return _parse_claude_json(raw)
 
 # ── DOCX editing ──────────────────────────────────────────────────────────────
 
