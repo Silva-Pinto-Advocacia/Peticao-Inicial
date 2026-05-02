@@ -295,6 +295,22 @@ def _extract_number(text: str) -> float | None:
     return None
 
 
+_UF_TO_STATE = {
+    "ES":"Espírito Santo", "MG":"Minas Gerais", "RJ":"Rio de Janeiro",
+    "SP":"São Paulo", "BA":"Bahia", "PR":"Paraná", "RS":"Rio Grande do Sul",
+    "PE":"Pernambuco", "CE":"Ceará", "GO":"Goiás", "DF":"Distrito Federal",
+    "AM":"Amazonas", "PA":"Pará", "MT":"Mato Grosso", "MS":"Mato Grosso do Sul",
+    "SC":"Santa Catarina", "AL":"Alagoas", "PB":"Paraíba", "RN":"Rio Grande do Norte",
+    "MA":"Maranhão", "PI":"Piauí", "TO":"Tocantins", "AC":"Acre",
+    "RO":"Rondônia", "RR":"Roraima", "AP":"Amapá", "SE":"Sergipe",
+}
+
+
+def _uf_to_state_name(uf: str) -> str:
+    return _UF_TO_STATE.get((uf or "").upper(), uf or "")
+
+
+
 def unpack_docx(docx_path: Path, out_dir: Path) -> bool:
     """Unpack docx (zip) into directory."""
     try:
@@ -725,8 +741,10 @@ def apply_substitutions(unpacked_dir: Path, data: dict) -> list[str]:
         if total_count > 0:
             changes.append(f"✅ '{old[:50]}' → '{new[:50]}' ({total_count}x)")
         else:
-            log.warning("  Não encontrado em nenhum arquivo: '%s'", old[:80])
-            changes.append(f"⚠️ Não encontrado: '{old[:60]}'")
+            # "Não encontrado" não é necessariamente um erro — pode ser que o
+            # texto sequer existia no modelo, o que é normal.
+            log.info("  Texto não encontrado (pode estar correto): '%s'", old[:80])
+            changes.append(f"ℹ️ Não localizado (talvez já correto): '{old[:60]}'")
 
     # Remove gratuidade chapter if not applicable
     p = data.get("processo", {})
@@ -739,7 +757,138 @@ def apply_substitutions(unpacked_dir: Path, data: dict) -> list[str]:
                 changes.append("🗑️ Capítulo de gratuidade removido")
                 break
 
+    # Rewrite "ROL DE QUESTÕES ILEGAIS" chapter using IA-provided question data
+    questoes = data.get("questoes", [])
+    if questoes:
+        doc_xml_path = unpacked_dir / "word" / "document.xml"
+        if doc_xml_path.exists():
+            xml = doc_xml_path.read_text(encoding="utf-8")
+            new_xml, n_replaced = _rewrite_questoes_chapter(xml, questoes)
+            if n_replaced > 0:
+                doc_xml_path.write_text(new_xml, encoding="utf-8")
+                changes.append(f"📜 Capítulo 'Rol de Questões Ilegais' reescrito com {len(questoes)} questões novas")
+            else:
+                changes.append("ℹ️ Capítulo 'Rol de Questões Ilegais' não localizado para reescrita automática")
+
     return changes
+
+
+def _rewrite_questoes_chapter(xml: str, questoes: list) -> tuple[str, int]:
+    """Locate the chapter 'DO ROL DE QUESTÕES ILEGAIS' (or similar) and replace
+    its question blocks with new ones based on the questoes list from IA.
+
+    Strategy: find the chapter title paragraph, then walk forward until the next
+    chapter title (typically all-caps line) and replace everything between with
+    new question blocks.
+    """
+    if not questoes:
+        return xml, 0
+
+    # Patterns that mark the start of the chapter
+    chapter_patterns = [
+        r"DO ROL DE QUEST[ÕO]ES ILEGAIS",
+        r"ROL DE QUEST[ÕO]ES ILEGAIS",
+        r"DAS QUEST[ÕO]ES ILEGAIS",
+        r"DA ILEGALIDADE DAS QUEST[ÕO]ES",
+        r"DAS QUEST[ÕO]ES ANUL[ÁA]VEIS",
+    ]
+    # Find chapter start in the visible text
+    pattern = re.compile(r'<w:t[^>]*>([^<]*)</w:t>', re.DOTALL)
+    matches = list(pattern.finditer(xml))
+    if not matches:
+        return xml, 0
+
+    concat = ""
+    positions = []  # (start_in_concat, end_in_concat, match_idx)
+    for i, m in enumerate(matches):
+        text = m.group(1)
+        start = len(concat)
+        concat += text
+        positions.append((start, start + len(text), i))
+
+    chapter_start_idx = None
+    for cp in chapter_patterns:
+        m = re.search(cp, concat, re.IGNORECASE)
+        if m:
+            chapter_start_idx = m.start()
+            break
+    if chapter_start_idx is None:
+        return xml, 0
+
+    # Find the paragraph containing chapter_start_idx
+    chapter_start_match_idx = None
+    for s, e, i in positions:
+        if s <= chapter_start_idx < e:
+            chapter_start_match_idx = i
+            break
+    if chapter_start_match_idx is None:
+        return xml, 0
+
+    # Find the corresponding <w:p> element start of that paragraph
+    chapter_start_in_xml = matches[chapter_start_match_idx].start()
+    p_start = xml.rfind('<w:p ', 0, chapter_start_in_xml)
+    if p_start < 0:
+        p_start = xml.rfind('<w:p>', 0, chapter_start_in_xml)
+    if p_start < 0:
+        return xml, 0
+    # End of chapter heading paragraph
+    p_end_marker = xml.find('</w:p>', p_start) + len('</w:p>')
+
+    # Now find the END of the chapter — next paragraph that looks like another chapter title
+    # (heuristic: ALL CAPS title >= 8 chars, mostly uppercase letters)
+    # Walk through paragraphs after chapter heading
+    end_of_chapter_in_xml = p_end_marker  # default: just after heading
+    next_chapter_keywords = [
+        r"DO\s+M[ÉE]RITO", r"DA\s+TUTELA", r"DOS\s+REQUERIMENTOS",
+        r"DOS\s+PEDIDOS", r"DA\s+ASSIST[ÊE]NCIA", r"DA\s+GRATUIDADE",
+        r"DO\s+VALOR\s+DA\s+CAUSA", r"DAS\s+PROVAS", r"DO\s+R[ÉE]U",
+        r"DO\s+JUIZADO", r"REQUER", r"TERMOS\s+EM\s+QUE",
+        r"DA\s+CITA[ÇC][ÃA]O", r"DA\s+ANULA[ÇC][ÃA]O\s+DAS\s+QUEST",  # explicit chapter
+    ]
+    next_chapter_re = re.compile("|".join(next_chapter_keywords), re.IGNORECASE)
+
+    # Find next chapter title in concat after chapter_start_idx + chapter_title_len
+    # We skip 100 chars to avoid the chapter title itself
+    search_start = chapter_start_idx + 50
+    next_match = next_chapter_re.search(concat, search_start)
+    if next_match:
+        next_match_idx_in_concat = next_match.start()
+        # Find which match index corresponds
+        for s, e, i in positions:
+            if s <= next_match_idx_in_concat < e:
+                next_p_start_in_xml = xml.rfind('<w:p ', 0, matches[i].start())
+                if next_p_start_in_xml < 0:
+                    next_p_start_in_xml = xml.rfind('<w:p>', 0, matches[i].start())
+                if next_p_start_in_xml > p_end_marker:
+                    end_of_chapter_in_xml = next_p_start_in_xml
+                break
+
+    # Build new XML for the chapter content (after the heading paragraph)
+    new_blocks_xml = ""
+    for q in questoes:
+        numero = q.get("numero", "?")
+        vicio  = q.get("vicio", "VÍCIO NÃO ESPECIFICADO")
+        resumo = q.get("resumo_peticao", "")
+        # Escape XML special chars
+        new_blocks_xml += (
+            f'<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            f'<w:pPr><w:spacing w:before="240" w:after="120"/></w:pPr>'
+            f'<w:r><w:rPr><w:b/><w:caps/></w:rPr>'
+            f'<w:t xml:space="preserve">QUESTÃO {xe(str(numero))} — {xe(str(vicio))}</w:t>'
+            f'</w:r></w:p>'
+        )
+        if resumo:
+            new_blocks_xml += (
+                f'<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                f'<w:pPr><w:jc w:val="both"/></w:pPr>'
+                f'<w:r><w:t xml:space="preserve">{xe(resumo)}</w:t></w:r>'
+                f'</w:p>'
+            )
+
+    # Replace chapter content (between heading end and next chapter start)
+    new_xml = xml[:p_end_marker] + new_blocks_xml + xml[end_of_chapter_in_xml:]
+    return new_xml, len(questoes)
+
 
 
 def _replace_across_runs(xml: str, old: str, new: str) -> str:
@@ -984,29 +1133,59 @@ def _filter_relatorio_questoes(docx_path: Path, keep_numbers: set[int]) -> bool:
         import docx as _docx
         doc = _docx.Document(str(docx_path))
 
-        # Walk through paragraphs and group by current question
+        # Multiple regex patterns to catch question headers in various forms
+        patterns = [
+            re.compile(r"(?i)\bquest[ãa]o\s*[nNº°.:]*\s*(\d{1,3})\b"),
+            re.compile(r"(?i)\bparecer\s+(?:da\s+)?(?:quest[ãa]o\s*)?[nNº°.:]*\s*(\d{1,3})\b"),
+            re.compile(r"(?i)\b(?:relat[óo]rio|an[áa]lise)\s+(?:da\s+)?(?:quest[ãa]o\s*)?[nNº°.:]*\s*(\d{1,3})\b"),
+            re.compile(r"(?i)^[Qq]\.?\s*(\d{1,3})\b"),
+            re.compile(r"(?i)^(\d{1,3})[\.\)]\s+(?:[A-ZÁÉÍÓÚ])"),  # "10. CONTEÚDO..." style
+        ]
+
+        # Also detect strong/bold paragraphs as section markers
+        def find_q_number(txt: str) -> int | None:
+            txt = txt.strip()
+            if not txt:
+                return None
+            for pat in patterns:
+                m = pat.search(txt)
+                if m:
+                    try:
+                        return int(m.group(1))
+                    except (ValueError, IndexError):
+                        continue
+            return None
+
         current_q = None
-        # Pattern matches headers: "QUESTÃO 10", "Questão 10", "10ª questão", "PARECER QUESTÃO 10"
-        question_header_re = re.compile(
-            r"(?i)(?:^|\b)(?:parecer\s+)?quest[ãa]o\s*[nNº°.:]*\s*(\d{1,3})"
-        )
-        # Track which paragraphs belong to which question
-        para_owner = []  # list aligned with doc.paragraphs
+        para_owner = []
         for p in doc.paragraphs:
             txt = p.text.strip()
-            m = question_header_re.search(txt)
-            if m:
-                current_q = int(m.group(1))
+            # Check if this paragraph IS a question header
+            qn = find_q_number(txt)
+            # Heuristic: only treat as new section if the para is short (header-like)
+            # OR it's bold/styled, OR the number found is at the very start
+            if qn is not None:
+                # If text length is short (<200) or starts with the question number
+                if len(txt) < 200 or any(p.search(txt[:50]) for p in patterns):
+                    current_q = qn
             para_owner.append(current_q)
 
-        # Now decide which paragraphs to remove
+        if not any(o in keep_numbers for o in para_owner if o is not None):
+            log.warning("Filtro: nenhuma das questões a manter %s foi detectada no relatório",
+                       sorted(keep_numbers))
+            return False
+
+        # Decide which paragraphs to remove
         to_remove_idx = []
         for i, owner in enumerate(para_owner):
             if owner is not None and owner not in keep_numbers:
                 to_remove_idx.append(i)
 
         if not to_remove_idx:
-            return False  # nothing changed
+            return False  # nothing to remove
+
+        log.info("Filtro de relatório: removendo %d parágrafos (de %d total)",
+                 len(to_remove_idx), len(doc.paragraphs))
 
         # Remove paragraphs in reverse to preserve indexes
         for i in reversed(to_remove_idx):
@@ -1022,15 +1201,19 @@ def _filter_relatorio_questoes(docx_path: Path, keep_numbers: set[int]) -> bool:
 
 
 def _convert_to_pdf(docx_path: Path, pdf_path: Path) -> bool:
-    """Convert DOCX to PDF using LibreOffice (soffice). Returns True on success."""
+    """Convert DOCX to PDF using LibreOffice (soffice). Returns True on success.
+
+    On Render free/Starter plans, LibreOffice is not installed by default.
+    To enable PDF conversion, add to the Build Command:
+        apt-get update && apt-get install -y libreoffice && pip install -r requirements.txt
+    Or use Docker with a custom image.
+    """
     import subprocess
-    # Try to find soffice
     soffice_candidates = [
-        "soffice",
-        "libreoffice",
-        "/usr/bin/soffice",
-        "/usr/bin/libreoffice",
+        "soffice", "libreoffice",
+        "/usr/bin/soffice", "/usr/bin/libreoffice",
         "/opt/libreoffice/program/soffice",
+        "/usr/lib/libreoffice/program/soffice",
     ]
     soffice_bin = None
     for cand in soffice_candidates:
@@ -1038,11 +1221,11 @@ def _convert_to_pdf(docx_path: Path, pdf_path: Path) -> bool:
             r = subprocess.run([cand, "--version"], capture_output=True, timeout=5)
             if r.returncode == 0:
                 soffice_bin = cand
+                log.info("LibreOffice encontrado: %s", cand)
                 break
         except (FileNotFoundError, subprocess.TimeoutExpired):
             continue
     if not soffice_bin:
-        log.warning("LibreOffice não encontrado — conversão PDF indisponível")
         return False
 
     try:
@@ -1055,7 +1238,6 @@ def _convert_to_pdf(docx_path: Path, pdf_path: Path) -> bool:
         if result.returncode != 0:
             log.warning("soffice falhou: %s", result.stderr)
             return False
-        # soffice creates the PDF with same basename
         generated = out_dir / (docx_path.stem + ".pdf")
         if generated.exists():
             if generated != pdf_path:
@@ -1181,14 +1363,23 @@ Observações: {form_data.get('obs','')}""")
     if ficha_estruturada:
         fe = ficha_estruturada
         auth_block = ["\n=== DADOS AUTORITATIVOS DO CLIENTE (extraídos da Ficha — USE EXATAMENTE ESTES VALORES) ==="]
-        auth_block.append(
-            "⚠️ ATENÇÃO ESPECIAL: O CLIENTE PODE MORAR EM UM ESTADO E PRESTAR CONCURSO EM OUTRO.\n"
-            "- A COMARCA refere-se à JURISDIÇÃO de endereçamento (geralmente domicílio do cliente).\n"
-            "- O CONCURSO é o do edital específico — pode ser de outro estado.\n"
-            "- NUNCA infira o estado do concurso a partir do endereço do cliente.\n"
-            "- Use SEMPRE o nome exato do concurso conforme a ficha (ex: PCES = Polícia Civil ES,\n"
-            "  PCMG = Polícia Civil MG, PCRJ = Polícia Civil RJ, etc.).\n"
-        )
+
+        # ─── DADOS DO CONCURSO (extraídos da ficha — fonte da verdade) ────────
+        if fe.get("estado_concurso") or fe.get("instituicao_concurso") or fe.get("concurso"):
+            auth_block.append("")
+            auth_block.append("─── DADOS DO CONCURSO PRESTADO ───")
+            if fe.get("instituicao_concurso"):
+                auth_block.append(f"Instituição: {fe['instituicao_concurso']}")
+            if fe.get("estado_concurso"):
+                auth_block.append(
+                    f"Estado: {fe['estado_concurso']} ({fe.get('uf_concurso','')})"
+                )
+            if fe.get("sigla_concurso"):
+                auth_block.append(f"Sigla: {fe['sigla_concurso']}")
+            if fe.get("concurso"):
+                auth_block.append(f"Nome completo: {fe['concurso']}")
+            auth_block.append("")
+
         if fe.get("nome_cliente"):
             auth_block.append(f"NOME COMPLETO: {fe['nome_cliente']}")
         if fe.get("rg"):
@@ -1202,11 +1393,11 @@ Observações: {form_data.get('obs','')}""")
         if fe.get("email"):
             auth_block.append(f"E-MAIL: {fe['email']}")
         if fe.get("endereco_completo"):
-            auth_block.append(f"ENDEREÇO: {fe['endereco_completo']}")
+            auth_block.append(f"ENDEREÇO (residência do cliente): {fe['endereco_completo']}")
         if fe.get("cidade"):
-            auth_block.append(f"CIDADE: {fe['cidade']}")
+            auth_block.append(f"CIDADE (residência): {fe['cidade']}")
         if fe.get("uf"):
-            auth_block.append(f"UF: {fe['uf']}")
+            auth_block.append(f"UF (residência): {fe['uf']}")
         if fe.get("cep"):
             auth_block.append(f"CEP: {fe['cep']}")
         if fe.get("comarca"):
@@ -1255,10 +1446,10 @@ Observações: {form_data.get('obs','')}""")
         if fe.get("resumo_fatos"):
             auth_block.append(f"RESUMO DOS FATOS: {fe['resumo_fatos']}")
         auth_block.append(
-            "\n⚠️ REGRA CRÍTICA: TODOS os pares de 'substituicoes' DEVEM usar EXATAMENTE os valores acima.\n"
-            "- Pontuação final: use o valor calculado acima — NUNCA invente outro número.\n"
-            "- Comarca: use o valor calculado acima.\n"
-            "- Se um campo está [NÃO INFORMADO], NÃO crie par de substituição — mantenha o do modelo.\n"
+            "\nREGRA: a petição final deve usar EXATAMENTE os valores acima — "
+            "tanto para o cliente (nome, qualificação, endereço) quanto para o concurso "
+            "(instituição, estado, sigla, banca, cargo, pontuação).\n"
+            "Se um campo está [NÃO INFORMADO], mantenha o valor do modelo.\n"
         )
         parts.append("\n".join(auth_block))
 
