@@ -4,7 +4,7 @@ Backend Flask com integração Claude API
 Estratégia: extração de texto de todos os arquivos — zero PDFs nativos na API
 """
 
-import os, sys, json, uuid, zipfile, shutil, logging, re, random, subprocess, tempfile, base64
+import os, sys, json, uuid, zipfile, shutil, logging, re, random, base64
 from pathlib import Path
 from datetime import datetime
 
@@ -15,8 +15,6 @@ import anthropic
 BASE_DIR   = Path(__file__).parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 OUTPUT_DIR = BASE_DIR / "output"
-SCRIPTS    = BASE_DIR / "scripts" / "office"
-
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -75,20 +73,25 @@ def extract_pdf_text(fpath: Path, max_chars: int = MAX_CHARS_PER_PDF) -> str:
         return f"[Não foi possível extrair texto: {fpath.name}]"
 
 def read_docx_text(path: Path, max_chars: int = MAX_CHARS_DOCX_OTHER) -> str:
-    tmp = Path(tempfile.mkdtemp())
+    """Read text from docx using python-docx (no subprocess)."""
     try:
-        result = subprocess.run(
-            [sys.executable, str(SCRIPTS / "unpack.py"), str(path), str(tmp)],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode == 0:
-            doc_xml = (tmp / "word" / "document.xml").read_text(encoding="utf-8")
-            return truncate(extract_xml_text(doc_xml), max_chars)
+        import docx as _docx
+        doc = _docx.Document(str(path))
+        parts = [p.text for p in doc.paragraphs if p.text.strip()]
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    if cell.text.strip():
+                        parts.append(cell.text.strip())
+        return truncate("\n".join(parts), max_chars)
     except Exception as e:
-        log.warning("docx read error %s: %s", path.name, e)
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-    return ""
+        log.warning("python-docx read error %s: %s", path.name, e)
+        try:
+            with zipfile.ZipFile(str(path)) as zf:
+                xml = zf.read("word/document.xml").decode("utf-8", errors="replace")
+            return truncate(extract_xml_text(xml), max_chars)
+        except Exception:
+            return ""
 
 def read_text_file(path: Path, max_chars: int = MAX_CHARS_PER_XLSX) -> str:
     try:
@@ -115,25 +118,38 @@ def read_text_file(path: Path, max_chars: int = MAX_CHARS_PER_XLSX) -> str:
         return ""
 
 def unpack_docx(docx_path: Path, out_dir: Path) -> bool:
-    result = subprocess.run(
-        [sys.executable, str(SCRIPTS / "unpack.py"), str(docx_path), str(out_dir)],
-        capture_output=True, text=True, timeout=60
-    )
-    if result.returncode != 0:
-        log.error("unpack: %s", result.stderr)
+    """Unpack docx (zip) into directory."""
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(str(docx_path), 'r') as zf:
+            zf.extractall(str(out_dir))
+        return True
+    except Exception as e:
+        log.error("unpack error: %s", e)
         return False
-    return True
 
 def pack_docx(unpacked_dir: Path, out_path: Path, original: Path) -> bool:
-    result = subprocess.run(
-        [sys.executable, str(SCRIPTS / "pack.py"),
-         str(unpacked_dir), str(out_path), "--original", str(original)],
-        capture_output=True, text=True, timeout=60
-    )
-    if result.returncode != 0:
-        log.error("pack: %s", result.stderr)
+    """Repack directory into docx (zip), preserving original file list order."""
+    try:
+        # Get file list from original to preserve content types order
+        orig_names = set()
+        with zipfile.ZipFile(str(original), 'r') as orig_zf:
+            orig_names = set(orig_zf.namelist())
+
+        with zipfile.ZipFile(str(out_path), 'w', zipfile.ZIP_DEFLATED) as zf:
+            # Write [Content_Types].xml first (required by OOXML spec)
+            ct = unpacked_dir / "[Content_Types].xml"
+            if ct.exists():
+                zf.write(str(ct), "[Content_Types].xml")
+            # Write all other files
+            for fpath in sorted(unpacked_dir.rglob("*")):
+                if fpath.is_file() and fpath.name != "[Content_Types].xml":
+                    arcname = str(fpath.relative_to(unpacked_dir))
+                    zf.write(str(fpath), arcname)
+        return True
+    except Exception as e:
+        log.error("pack error: %s", e)
         return False
-    return True
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
 
