@@ -166,7 +166,7 @@ SUAS RESPONSABILIDADES:
 6. Se o cliente NÃO tiver direito à gratuidade (conforme ficha), indicar gratuidade: false.
 7. Verificar concordância de gênero em todo o texto gerado.
 8. Verificar se a comarca está correta conforme domicílio do cliente.
-9. Sinalizar campos ausentes com [DADO AUSENTE — descrição].
+9. Sinalizar campos ausentes com a string SIMPLES "[DADO AUSENTE]" (sem descrições longas — apenas essa marcação curta para economizar tokens).
 
 FORMATO DE RESPOSTA — JSON PURO (sem markdown, sem backticks, sem texto antes ou depois).
 REGRAS CRÍTICAS PARA O JSON:
@@ -312,13 +312,22 @@ def call_claude(api_key: str, full_text: str) -> dict:
     log.info("Sending %d chars to Claude", len(full_text))
     message = client.messages.create(
         model="claude-sonnet-4-5",
-        max_tokens=8000,
+        max_tokens=16000,  # increased to avoid JSON truncation
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": full_text}]
     )
-    log.info("Claude response received: %d input tokens, %d output tokens",
+    log.info("Claude response: %d input / %d output tokens. Stop reason: %s",
              message.usage.input_tokens if message.usage else 0,
-             message.usage.output_tokens if message.usage else 0)
+             message.usage.output_tokens if message.usage else 0,
+             message.stop_reason)
+
+    # Detect truncation
+    if message.stop_reason == "max_tokens":
+        raise ValueError(
+            "A resposta do Claude foi truncada por exceder o limite de tokens. "
+            "Tente um ZIP com menos arquivos ou peça em duas etapas."
+        )
+
     raw = "".join(b.text for b in message.content if hasattr(b, "text"))
     return _parse_claude_json(raw)
 
