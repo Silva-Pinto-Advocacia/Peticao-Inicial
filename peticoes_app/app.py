@@ -662,8 +662,12 @@ def call_claude(api_key: str, full_text: str) -> dict:
 
 # ── DOCX editing ──────────────────────────────────────────────────────────────
 
-def apply_substitutions(unpacked_dir: Path, data: dict) -> list[str]:
-    """Apply find/replace pairs from Claude across XML and headers/footers."""
+def apply_substitutions(unpacked_dir: Path, data: dict, ficha: dict | None = None) -> list[str]:
+    """Apply find/replace pairs from Claude across XML and headers/footers.
+
+    `ficha` is the parsed ficha_estruturada — used to inject system-generated
+    pairs that the IA might miss (like Tipo X of the prova).
+    """
     changes = []
 
     # Files to edit: document.xml + headers + footers
@@ -683,7 +687,18 @@ def apply_substitutions(unpacked_dir: Path, data: dict) -> list[str]:
     # Important to do this BEFORE pair substitutions, so that pairs targeting
     # old question text don't accidentally match new content (and vice-versa).
     questoes = data.get("questoes", [])
+    log.info("Array 'questoes' recebido da IA: %d itens", len(questoes))
     if questoes:
+        # Log a quick summary of each question to verify content quality
+        for q in questoes:
+            log.info(
+                "  Q%s | %s | enunciado=%dchars | alternativas=%d | relatorio=%dchars",
+                q.get("numero","?"),
+                (q.get("vicio") or "")[:30],
+                len(q.get("enunciado","") or ""),
+                len(q.get("alternativas") or []),
+                len(q.get("relatorio_integra","") or q.get("resumo_peticao","") or ""),
+            )
         doc_xml_path = unpacked_dir / "word" / "document.xml"
         if doc_xml_path.exists():
             xml = doc_xml_path.read_text(encoding="utf-8")
@@ -697,9 +712,62 @@ def apply_substitutions(unpacked_dir: Path, data: dict) -> list[str]:
                 changes.append(
                     "ℹ️ Capítulo 'Rol de Questões Ilegais' não localizado para reescrita automática"
                 )
+    else:
+        log.warning(
+            "IA NÃO populou o array 'questoes' — capítulo das questões anuláveis "
+            "ficará com o conteúdo do modelo (questões antigas)."
+        )
+        changes.append(
+            "⚠️ A IA não retornou dados das questões — capítulo das anuláveis "
+            "permaneceu com texto do modelo. Edite manualmente."
+        )
 
     # ── STEP B: Apply find/replace pairs from Claude response ────────────────
-    pairs = data.get("substituicoes", [])
+    pairs = list(data.get("substituicoes", []))
+
+    # ── STEP B.1: Inject system pairs from ficha (deterministic) ─────────────
+    # These are auto-generated to fix things the IA might miss
+    if ficha:
+        tipo_prova = (ficha.get("tipo_prova") or "").strip()
+        if tipo_prova:
+            # Extract the type number (e.g. "Tipo 4" → "4", or just "4" → "4")
+            m_tipo = re.search(r"\d+", tipo_prova)
+            if m_tipo:
+                num_correto = m_tipo.group(0)
+                # Generate pairs that translate any "Tipo N" to "Tipo {num_correto}"
+                # WARNING: Only inject if "Tipo N" with N != num_correto exists somewhere
+                # Read the current document text to check
+                doc_xml_path = unpacked_dir / "word" / "document.xml"
+                if doc_xml_path.exists():
+                    xml_now = doc_xml_path.read_text(encoding="utf-8")
+                    text_now = re.sub(r"<[^>]+>", " ", xml_now)
+                    text_now = re.sub(r"\s+", " ", text_now)
+                    # Find all "Tipo N" present
+                    found_tipos = set(re.findall(r"\b[Tt]ipo\s+(\d+)\b", text_now))
+                    for found in found_tipos:
+                        if found != num_correto:
+                            # Add pairs for both case variations
+                            pairs.insert(0, {
+                                "buscar": f"Prova Tipo {found}",
+                                "substituir": f"Prova Tipo {num_correto}"
+                            })
+                            pairs.insert(0, {
+                                "buscar": f"prova tipo {found}",
+                                "substituir": f"prova tipo {num_correto}"
+                            })
+                            pairs.insert(0, {
+                                "buscar": f"PROVA TIPO {found}",
+                                "substituir": f"PROVA TIPO {num_correto}"
+                            })
+                            pairs.insert(0, {
+                                "buscar": f"Tipo {found}",
+                                "substituir": f"Tipo {num_correto}"
+                            })
+                            log.info(
+                                "Sistema gerou pares automáticos para Tipo %s → Tipo %s",
+                                found, num_correto
+                            )
+
     log.info("Total de substituições a aplicar: %d", len(pairs))
     if not pairs:
         changes.append("⚠️ Nenhum par de substituição retornado pelo Claude")
@@ -724,6 +792,23 @@ def apply_substitutions(unpacked_dir: Path, data: dict) -> list[str]:
             )
             changes.append(
                 f"⚠️ Par recursivo ignorado (geraria loop): '{old[:60]}' → '{new[:60]}'"
+            )
+            continue
+        # Reject pairs that would inject placeholder markers into the document
+        bad_markers = [
+            "[NÃO INFORMADO", "[NAO INFORMADO", "[NÃO INFORMADA", "[NAO INFORMADA",
+            "[DADO AUSENTE", "[RELATÓRIO COMPLETO NÃO FORNECIDO",
+            "[RELATÓRIO TÉCNICO", "[NÃO CONSTA", "[NAO CONSTA",
+        ]
+        new_upper = new.upper()
+        if any(marker.upper() in new_upper for marker in bad_markers):
+            log.warning(
+                "Par #%d: 'substituir' contém marcador interno (placeholder), pulando. "
+                "buscar='%s', substituir='%s'",
+                pair_idx, old[:60], new[:80]
+            )
+            changes.append(
+                f"⚠️ Par com placeholder ignorado: '{old[:50]}' → '{new[:50]}'"
             )
             continue
 
@@ -1465,8 +1550,8 @@ Observações: {form_data.get('obs','')}""")
             auth_block.append(f"BANCA: {fe['banca']}")
         if fe.get("cargo"):
             auth_block.append(f"CARGO: {fe['cargo']}")
-        else:
-            auth_block.append("CARGO: [NÃO INFORMADO — manter o do modelo]")
+        # Note: campos não informados (cargo, nota_corte) NÃO são listados.
+        # A IA é instruída a manter o valor do modelo quando o dado não vier da ficha.
         if fe.get("tipo_prova"):
             auth_block.append(f"TIPO DE PROVA: Tipo {fe['tipo_prova'].replace('Tipo','').strip()}")
         if fe.get("pontuacao_obtida"):
@@ -1480,8 +1565,6 @@ Observações: {form_data.get('obs','')}""")
             )
         if fe.get("nota_corte"):
             auth_block.append(f"NOTA DE CORTE: {fe['nota_corte']}")
-        else:
-            auth_block.append("NOTA DE CORTE: [NÃO INFORMADA NA FICHA]")
         if fe.get("questoes_anular"):
             auth_block.append(f"QUESTÕES A ANULAR: {fe['questoes_anular']}")
         if fe.get("gratuidade"):
@@ -1493,10 +1576,21 @@ Observações: {form_data.get('obs','')}""")
         if fe.get("resumo_fatos"):
             auth_block.append(f"RESUMO DOS FATOS: {fe['resumo_fatos']}")
         auth_block.append(
-            "\nREGRA: a petição final deve usar EXATAMENTE os valores acima — "
-            "tanto para o cliente (nome, qualificação, endereço) quanto para o concurso "
-            "(instituição, estado, sigla, banca, cargo, pontuação).\n"
-            "Se um campo está [NÃO INFORMADO], mantenha o valor do modelo.\n"
+            "\nREGRAS PARA OS PARES DE SUBSTITUIÇÃO:\n"
+            "1. Use APENAS os valores acima como fonte da verdade.\n"
+            "2. Se um campo NÃO está listado acima (ex: cargo, nota de corte),\n"
+            "   significa que NÃO foi informado pela ficha — NESSE CASO mantenha\n"
+            "   o valor do modelo intacto e NÃO crie par de substituição para ele.\n"
+            "3. NUNCA, em hipótese alguma, escreva textos como '[NÃO INFORMADO]',\n"
+            "   '[DADO AUSENTE]', '[NÃO INFORMADA NA FICHA]' ou similar como VALOR\n"
+            "   da petição final. Esses são marcadores internos, não devem aparecer\n"
+            "   no documento final.\n"
+            "4. O ESTADO E A INSTITUIÇÃO DO CONCURSO já estão corretos no modelo\n"
+            "   se coincidirem com a ficha. NÃO troque '{est}' por outro estado.\n"
+            "   NÃO troque '{inst}' por outra instituição.\n".format(
+                est=fe.get("estado_concurso") or "(estado do concurso)",
+                inst=fe.get("instituicao_concurso") or "(instituição do concurso)",
+            )
         )
         parts.append("\n".join(auth_block))
 
@@ -1523,27 +1617,50 @@ Observações: {form_data.get('obs','')}""")
         full_relat = read_docx_text(fpath, max_chars=200_000)
         parts.append(
             f"\n=== RELATÓRIO TÉCNICO DAS QUESTÕES — arquivo: {rname} ===\n"
-            f"Este arquivo contém os pareceres técnicos de várias questões, mas você\n"
-            f"deve usar APENAS as questões que estão na lista 'QUESTÕES A ANULAR' da ficha.\n"
+            f"Este arquivo contém os pareceres técnicos das questões impugnáveis.\n"
+            f"\n"
+            f"⚠️ IMPORTANTE SOBRE TIPOS DE PROVA:\n"
+            f"O concurso é aplicado em vários TIPOS de prova (Tipo 1, 2, 3, 4...).\n"
+            f"A MESMA questão tem CONTEÚDO IDÊNTICO em todos os tipos, mas com\n"
+            f"NUMERAÇÃO DIFERENTE em cada tipo (ex: Q10 do Tipo 2 = Q1 do Tipo 4).\n"
+            f"O relatório técnico pode estar organizado por um TIPO ESPECÍFICO,\n"
+            f"e o cliente pode ter feito OUTRO tipo. Quando isso acontecer:\n"
+            f"  1. Olhe o ENUNCIADO e o CONTEÚDO da questão no relatório.\n"
+            f"  2. Localize a MESMA questão (mesmo enunciado e mesmas alternativas)\n"
+            f"     na lista da ficha do cliente — apenas o número difere.\n"
+            f"  3. Use o conteúdo do relatório, mas com a NUMERAÇÃO da ficha.\n"
+            f"  4. Os relatórios são CONFIÁVEIS independentemente do tipo de prova.\n"
             f"\n"
             f"INSTRUÇÕES PARA POPULAR O ARRAY 'questoes' DO JSON:\n"
-            f"1. Para CADA questão da lista da ficha, localize o parecer correspondente\n"
-            f"   neste relatório (procure por 'Questão N', 'PARECER QUESTÃO N', etc.).\n"
-            f"2. Se o relatório tiver um tópico final 'RESUMOS' ou 'SÍNTESE' (geralmente\n"
-            f"   no final do arquivo, com todos os enunciados + fundamentações compactos),\n"
-            f"   USE PREFERENCIALMENTE essa versão para o campo 'relatorio_integra' —\n"
-            f"   ela já vem otimizada para a petição inicial.\n"
-            f"3. Caso contrário, use o parecer técnico completo da questão.\n"
-            f"4. Para cada questão, popule:\n"
-            f"   - numero, vicio (palavras-chave em CAIXA ALTA)\n"
-            f"   - enunciado: comando + texto da questão num único parágrafo\n"
-            f"   - alternativas: lista A/B/C/D/E\n"
-            f"   - relatorio_integra: a fundamentação (do tópico Resumos, se existir)\n"
-            f"5. Se uma questão da lista da ficha NÃO estiver no relatório, adicione-a\n"
-            f"   ao array 'dados_ausentes' como 'Relatório técnico da questão N ausente'.\n"
             f"\n"
-            f"NÃO gere pares de 'substituicoes' para os blocos das questões — o sistema\n"
-            f"reescreve esse capítulo automaticamente usando o array 'questoes'.\n\n"
+            f"1. Para CADA questão da lista 'QUESTÕES A ANULAR' da ficha:\n"
+            f"   - localize o parecer correspondente neste relatório (pelo conteúdo,\n"
+            f"     não apenas pelo número — veja regra acima sobre tipos de prova).\n"
+            f"\n"
+            f"2. Se o relatório tem um tópico final 'RESUMOS' ou 'SÍNTESE'\n"
+            f"   (geralmente no final do arquivo, com enunciados + fundamentações\n"
+            f"   compactos), USE PREFERENCIALMENTE essa versão para o campo\n"
+            f"   'relatorio_integra' — ela já está otimizada para a petição.\n"
+            f"\n"
+            f"3. Se NÃO houver tópico de resumos, use o parecer técnico completo\n"
+            f"   da questão.\n"
+            f"\n"
+            f"4. Para cada questão, popule:\n"
+            f"   - numero: número da questão NA FICHA DO CLIENTE\n"
+            f"   - vicio: tipo do vício em CAIXA ALTA (ex: ERRO GROSSEIRO,\n"
+            f"     EXTRAPOLAÇÃO DO EDITAL, AUSÊNCIA DE RESPOSTA CORRETA)\n"
+            f"   - enunciado: comando + texto da questão num único parágrafo\n"
+            f"   - alternativas: lista A/B/C/D/E (uma string por elemento)\n"
+            f"   - relatorio_integra: a fundamentação completa\n"
+            f"\n"
+            f"5. ⚠️ NUNCA escreva textos como '[DADO AUSENTE — questão X não consta\n"
+            f"   no relatório]' ou similares como VALOR de qualquer campo. Se você\n"
+            f"   realmente não consegue localizar a questão no relatório, deixe os\n"
+            f"   campos VAZIOS ('') e não inclua a questão no array.\n"
+            f"\n"
+            f"6. NÃO gere pares de 'substituicoes' para os blocos das questões —\n"
+            f"   o sistema reescreve esse capítulo automaticamente usando o array\n"
+            f"   'questoes'.\n\n"
             f"{full_relat}"
         )
 
@@ -1605,7 +1722,7 @@ Observações: {form_data.get('obs','')}""")
         return {"error": "Falha ao desempacotar o modelo DOCX."}
 
     # 6. Apply edits
-    changes = apply_substitutions(unpacked_dir, data)
+    changes = apply_substitutions(unpacked_dir, data, ficha=ficha_estruturada)
 
     # 6b. ROUND 2 REVIEW — extract current text, ask Claude what data is still old
     try:
@@ -1695,7 +1812,8 @@ TEXTO DA PETIÇÃO ATUAL:
                              len(review_pairs), len(review_pairs_raw))
                     review_changes = apply_substitutions(
                         unpacked_dir,
-                        {"substituicoes": review_pairs, "processo": {"gratuidade": True}}
+                        {"substituicoes": review_pairs, "processo": {"gratuidade": True}},
+                        ficha=ficha_estruturada,
                     )
                     changes.extend(["📝 ROUND 2 (revisão automática):"] + review_changes)
                 else:
