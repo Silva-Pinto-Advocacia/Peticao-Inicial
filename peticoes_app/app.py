@@ -506,37 +506,41 @@ def apply_substitutions(unpacked_dir: Path, data: dict) -> list[str]:
 
         for xml_path in files_to_edit:
             xml = xml_path.read_text(encoding="utf-8")
-            file_count = 0
+            file_count_literal = 0
+            file_count_crossrun = 0
 
-            # Method 1: literal XML-escaped match
+            # Method 1: literal XML-escaped match (substitutes ALL occurrences)
             count = xml.count(old_xe)
             if count > 0:
                 xml = xml.replace(old_xe, new_xe)
-                file_count += count
-                method_used = "literal"
-                xml_path.write_text(xml, encoding="utf-8")
+                file_count_literal = count
 
-            # Method 2: cross-run replacement (loop until no more matches)
-            else:
-                attempts = 0
-                while attempts < 20:  # safety limit
-                    new_xml = _replace_across_runs(xml, old, new)
-                    if new_xml == xml:
-                        break
-                    xml = new_xml
-                    file_count += 1
-                    attempts += 1
+            # Method 2: cross-run replacement (loop for any remaining fragmented occurrences)
+            attempts = 0
+            while attempts < 30:  # safety limit
+                new_xml = _replace_across_runs(xml, old, new)
+                if new_xml == xml:
+                    break
+                xml = new_xml
+                file_count_crossrun += 1
+                attempts += 1
+
+            file_count = file_count_literal + file_count_crossrun
+            if file_count > 0:
+                xml_path.write_text(xml, encoding="utf-8")
+                method_used = "mixed"
+                if file_count_literal > 0 and file_count_crossrun == 0:
+                    method_used = "literal"
+                elif file_count_crossrun > 0 and file_count_literal == 0:
                     method_used = "cross-run"
-                if file_count > 0:
-                    xml_path.write_text(xml, encoding="utf-8")
+                log.info("  %s: %d replacement(s) via %s (lit=%d, x-run=%d)",
+                         xml_path.name, file_count, method_used,
+                         file_count_literal, file_count_crossrun)
 
             total_count += file_count
-            if file_count > 0:
-                log.info("  %s: %d replacement(s) via %s",
-                         xml_path.name, file_count, method_used)
 
         if total_count > 0:
-            changes.append(f"✅ [{method_used}] '{old[:50]}' → '{new[:50]}' ({total_count}x)")
+            changes.append(f"✅ '{old[:50]}' → '{new[:50]}' ({total_count}x)")
         else:
             log.warning("  Não encontrado em nenhum arquivo: '%s'", old[:80])
             changes.append(f"⚠️ Não encontrado: '{old[:60]}'")
@@ -906,6 +910,63 @@ Observações: {form_data.get('obs','')}""")
 
     # 6. Apply edits
     changes = apply_substitutions(unpacked_dir, data)
+
+    # 6b. ROUND 2 REVIEW — extract current text, ask Claude what data is still old
+    try:
+        doc_xml_path = unpacked_dir / "word" / "document.xml"
+        if doc_xml_path.exists():
+            current_xml = doc_xml_path.read_text(encoding="utf-8")
+            current_text = re.sub(r"<[^>]+>", " ", current_xml)
+            current_text = re.sub(r"\s+", " ", current_text).strip()
+            # Limit to 30k chars for review
+            current_text_limited = current_text[:30_000]
+
+            cliente_novo = data.get("cliente", {})
+            processo = data.get("processo", {})
+
+            review_prompt = f"""Abaixo está o texto da petição APÓS a primeira rodada de substituições.
+O cliente correto é: {cliente_novo.get('nome_completo','')}, RG {cliente_novo.get('rg','')}, CPF {cliente_novo.get('cpf','')}.
+Endereço: {cliente_novo.get('endereco','')}, {cliente_novo.get('cidade','')}/{cliente_novo.get('uf','')}.
+Comarca correta: {processo.get('comarca','')}.
+Pontuação obtida: {processo.get('pontuacao_obtida','')}, após anulação: {processo.get('pontuacao_apos_anulacao','')}, corte: {processo.get('pontuacao_corte','')}.
+Cargo: {processo.get('cargo','')}, Banca: {processo.get('banca','')}.
+
+ANALISE o texto abaixo e identifique QUAISQUER dados que ainda pertençam ao cliente antigo
+(nomes, números, endereços, pontuações, comarcas etc.) que precisem ser substituídos.
+Retorne APENAS um JSON puro com o array "substituicoes" (mesmo formato anterior).
+Se nada precisa ser substituído, retorne {{"substituicoes": []}}.
+Não inclua explicações nem markdown.
+
+TEXTO DA PETIÇÃO (após primeira rodada):
+{current_text_limited}"""
+
+            log.info("Round 2: enviando %d chars para revisão", len(review_prompt))
+            client = anthropic.Anthropic(api_key=api_key, timeout=300.0, max_retries=2)
+            review_msg = client.messages.create(
+                model="claude-sonnet-4-5",
+                max_tokens=8000,
+                system="Você é um revisor jurídico. Identifique dados do cliente antigo que ainda restem no texto e gere pares de substituição em JSON.",
+                messages=[{"role": "user", "content": review_prompt}]
+            )
+            review_raw = "".join(b.text for b in review_msg.content if hasattr(b, "text"))
+            log.info("Round 2 response: %d output tokens", review_msg.usage.output_tokens if review_msg.usage else 0)
+
+            try:
+                review_data = _parse_claude_json(review_raw)
+                review_pairs = review_data.get("substituicoes", [])
+                if review_pairs:
+                    log.info("Round 2: %d pares adicionais para aplicar", len(review_pairs))
+                    review_changes = apply_substitutions(unpacked_dir, {"substituicoes": review_pairs, "processo": {"gratuidade": True}})
+                    changes.extend(["📝 ROUND 2:"] + review_changes)
+                else:
+                    log.info("Round 2: nenhum dado antigo detectado")
+                    changes.append("✅ ROUND 2: nenhum dado antigo restante detectado")
+            except Exception as e:
+                log.warning("Round 2 review parse failed: %s", e)
+                changes.append(f"⚠️ Round 2 falhou: {e}")
+    except Exception as e:
+        log.warning("Round 2 skipped: %s", e)
+        changes.append(f"⚠️ Round 2 não executou: {e}")
 
     # 7. Repack
     safe_nome  = re.sub(r"[^\w\s]","",data.get("cliente",{}).get("nome_completo","Cliente")).replace(" ","_")
