@@ -530,7 +530,45 @@ Observações: {form_data.get('obs','')}""")
         "relatorio":      data.get("relatorio_alteracoes", []),
     }
 
+# ── Global error handlers ─────────────────────────────────────────────────────
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    log.exception("Unhandled exception")
+    return jsonify({"error": f"Erro interno: {str(e)}"}), 500
+
+@app.errorhandler(413)
+def too_large(e):
+    return jsonify({"error": "Arquivo muito grande. Limite: 100 MB."}), 413
+
 # ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.route("/health")
+def health():
+    """Healthcheck + diagnostic endpoint."""
+    import sys
+    checks = {}
+    try:
+        import pdfplumber
+        checks["pdfplumber"] = "ok"
+    except ImportError as e:
+        checks["pdfplumber"] = f"MISSING: {e}"
+    try:
+        import openpyxl
+        checks["openpyxl"] = "ok"
+    except ImportError as e:
+        checks["openpyxl"] = f"MISSING: {e}"
+    try:
+        import anthropic
+        checks["anthropic"] = "ok"
+    except ImportError as e:
+        checks["anthropic"] = f"MISSING: {e}"
+    checks["unpack_py"]  = "ok" if (SCRIPTS / "unpack.py").exists() else "MISSING"
+    checks["pack_py"]    = "ok" if (SCRIPTS / "pack.py").exists() else "MISSING"
+    checks["upload_dir"] = str(UPLOAD_DIR)
+    checks["output_dir"] = str(OUTPUT_DIR)
+    checks["python"]     = sys.version
+    return jsonify(checks)
 
 @app.route("/")
 def index():
