@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: gerador-peticoes
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --threads 2 --timeout 600 --keep-alive 65 --bind 0.0.0.0:$PORT --log-level debug
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0

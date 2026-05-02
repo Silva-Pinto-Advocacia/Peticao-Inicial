@@ -53,20 +53,26 @@ def truncate(text: str, max_chars: int) -> str:
     return text[:max_chars] + f"\n...[TRUNCADO — {len(text)-max_chars} chars omitidos]"
 
 def extract_pdf_text(fpath: Path, max_chars: int = MAX_CHARS_PER_PDF) -> str:
-    """Extract text from PDF using pdfplumber. Falls back to empty string."""
+    """Extract text from PDF using pypdf (lightweight, Python 3.14 safe)."""
     try:
-        import pdfplumber
+        import pypdf
         text_parts = []
-        with pdfplumber.open(str(fpath)) as pdf:
-            for page in pdf.pages[:8]:  # max 8 pages
-                t = page.extract_text()
-                if t:
-                    text_parts.append(t)
+        with open(fpath, "rb") as f:
+            reader = pypdf.PdfReader(f, strict=False)
+            for page in reader.pages[:8]:
+                try:
+                    t = page.extract_text()
+                    if t:
+                        text_parts.append(t)
+                except Exception:
+                    pass
         full = "\n".join(text_parts)
+        if not full.strip():
+            return f"[PDF sem texto extraível: {fpath.name}]"
         return truncate(full, max_chars)
     except Exception as e:
-        log.warning("pdfplumber failed for %s: %s", fpath.name, e)
-        return f"[Não foi possível extrair texto deste PDF: {fpath.name}]"
+        log.warning("pypdf failed for %s: %s", fpath.name, e)
+        return f"[Não foi possível extrair texto: {fpath.name}]"
 
 def read_docx_text(path: Path, max_chars: int = MAX_CHARS_DOCX_OTHER) -> str:
     tmp = Path(tempfile.mkdtemp())
@@ -549,10 +555,9 @@ def health():
     import sys
     checks = {}
     try:
-        import pdfplumber
-        checks["pdfplumber"] = "ok"
+                checks["pypdf"] = "ok"
     except ImportError as e:
-        checks["pdfplumber"] = f"MISSING: {e}"
+        checks["pypdf"] = f"MISSING: {e}"
     try:
         import openpyxl
         checks["openpyxl"] = "ok"
@@ -576,40 +581,56 @@ def index():
 
 @app.route("/gerar", methods=["POST"])
 def gerar():
-    api_key = request.form.get("api_key", "").strip()
-    if not api_key:
-        return jsonify({"error": "Chave de API não fornecida."}), 400
-    if "zip_file" not in request.files or request.files["zip_file"].filename == "":
-        return jsonify({"error": "Arquivo ZIP não enviado."}), 400
-    zip_file = request.files["zip_file"]
-    if not zip_file.filename.lower().endswith(".zip"):
-        return jsonify({"error": "Apenas arquivos .zip são aceitos."}), 400
-
-    session_id  = str(uuid.uuid4())
-    session_dir = UPLOAD_DIR / session_id
-    session_dir.mkdir()
-    zip_path = session_dir / "input.zip"
-    zip_file.save(str(zip_path))
-
-    form_data = {k: request.form.get(k, "") for k in ("tipo_acao","comarca","fatos","pedidos","obs")}
-
+    import traceback
     try:
-        result = process_zip(zip_path, session_dir, form_data, api_key)
-    except anthropic.AuthenticationError:
-        return jsonify({"error": "Chave de API inválida."}), 401
-    except anthropic.RateLimitError:
-        return jsonify({"error": "Limite de uso da API atingido. Aguarde."}), 429
-    except json.JSONDecodeError as e:
-        return jsonify({"error": f"Claude não retornou JSON válido: {e}"}), 500
+        api_key = request.form.get("api_key", "").strip()
+        if not api_key:
+            return jsonify({"error": "Chave de API não fornecida."}), 400
+        if "zip_file" not in request.files or request.files["zip_file"].filename == "":
+            return jsonify({"error": "Arquivo ZIP não enviado."}), 400
+        zip_file = request.files["zip_file"]
+        if not zip_file.filename.lower().endswith(".zip"):
+            return jsonify({"error": "Apenas arquivos .zip são aceitos."}), 400
+
+        session_id  = str(uuid.uuid4())
+        session_dir = UPLOAD_DIR / session_id
+        session_dir.mkdir(parents=True, exist_ok=True)
+        zip_path = session_dir / "input.zip"
+
+        log.info("Saving uploaded ZIP...")
+        zip_file.save(str(zip_path))
+        log.info("ZIP saved: %s bytes", zip_path.stat().st_size)
+
+        form_data = {k: request.form.get(k, "") for k in ("tipo_acao","comarca","fatos","pedidos","obs")}
+
+        try:
+            result = process_zip(zip_path, session_dir, form_data, api_key)
+        except anthropic.AuthenticationError:
+            return jsonify({"error": "Chave de API inválida. Verifique suas credenciais em console.anthropic.com"}), 401
+        except anthropic.RateLimitError:
+            return jsonify({"error": "Limite de uso da API Anthropic atingido. Aguarde alguns minutos."}), 429
+        except anthropic.APIStatusError as e:
+            log.exception("Anthropic API error")
+            return jsonify({"error": f"Erro da API Anthropic: {e.status_code} — {e.message}"}), 502
+        except json.JSONDecodeError as e:
+            log.exception("JSON decode error")
+            return jsonify({"error": f"Claude não retornou JSON válido: {e}"}), 500
+        except Exception as e:
+            log.exception("Pipeline error")
+            tb = traceback.format_exc()
+            return jsonify({"error": str(e), "traceback": tb[-2000:]}), 500
+
+        if "error" in result:
+            return jsonify(result), 500
+
+        result["session_id"] = session_id
+        log.info("Request completed OK: %s", result.get("zip_filename"))
+        return jsonify(result)
+
     except Exception as e:
-        log.exception("Pipeline error")
-        return jsonify({"error": str(e)}), 500
-
-    if "error" in result:
-        return jsonify(result), 500
-
-    result["session_id"] = session_id
-    return jsonify(result)
+        log.exception("Outer exception in /gerar")
+        tb = traceback.format_exc()
+        return jsonify({"error": f"Erro inesperado: {str(e)}", "traceback": tb[-2000:]}), 500
 
 @app.route("/download/<session_id>/<filename>")
 def download(session_id, filename):
