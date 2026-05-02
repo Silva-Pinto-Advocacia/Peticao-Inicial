@@ -185,6 +185,35 @@ def parse_ficha_cliente(path: Path) -> dict:
         out["tipo_acao"]         = find_field("tipo de ação")
         out["proxima_fase"]      = find_field("data da próxima fase") or find_field("próxima fase")
 
+        # Extract instituição/estado do concurso a partir do nome do concurso
+        # Ex: "PCES – Polícia Civil do Espírito Santo" → instituição = Polícia Civil do Espírito Santo
+        if out.get("concurso"):
+            conc = out["concurso"]
+            # Try to detect Polícia Civil + estado
+            m = re.search(
+                r"(Pol[íi]cia\s+(?:Civil|Militar|Federal|Rodovi[áa]ria)\s+(?:do\s+)?(?:Estado\s+(?:do|de|da)\s+)?[A-ZÁÉÍÓÚÂÊÔÃÕa-záéíóúâêôãõç ]+)",
+                conc, re.IGNORECASE
+            )
+            if m:
+                out["instituicao_concurso"] = m.group(1).strip().rstrip(",.")
+            # Detect state code (ES, MG, RJ, SP etc.) at start of concurso
+            m2 = re.match(r"^P[CMF][A-Z]{2}", conc.strip())
+            if m2:
+                state_code = m2.group(0)[2:]  # Last 2 letters
+                state_map = {
+                    "ES":"Espírito Santo", "MG":"Minas Gerais", "RJ":"Rio de Janeiro",
+                    "SP":"São Paulo", "BA":"Bahia", "PR":"Paraná", "RS":"Rio Grande do Sul",
+                    "PE":"Pernambuco", "CE":"Ceará", "GO":"Goiás", "DF":"Distrito Federal",
+                    "AM":"Amazonas", "PA":"Pará", "MT":"Mato Grosso", "MS":"Mato Grosso do Sul",
+                    "SC":"Santa Catarina", "AL":"Alagoas", "PB":"Paraíba", "RN":"Rio Grande do Norte",
+                    "MA":"Maranhão", "PI":"Piauí", "TO":"Tocantins", "AC":"Acre",
+                    "RO":"Rondônia", "RR":"Roraima", "AP":"Amapá", "SE":"Sergipe",
+                }
+                out["estado_concurso"] = state_map.get(state_code, state_code)
+                out["uf_concurso"] = state_code
+                # Sigla da instituição, ex: PCES
+                out["sigla_concurso"] = m2.group(0)
+
         # Compute pontuacao_final: obtida + delta
         try:
             obtida_num = _extract_number(out["pontuacao_obtida"])
@@ -933,6 +962,111 @@ def rename_files_by_rol(work_dir: Path, rol: list) -> dict:
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 
+def _parse_question_numbers(text: str) -> set[int]:
+    """Extract question numbers from a string like '1, 6, 10, 18, 31 e 74 (excluída a 25...)'."""
+    if not text:
+        return set()
+    # Remove text in parentheses to avoid catching numbers inside notes
+    cleaned = re.sub(r"\([^)]*\)", "", text)
+    # Capture all digit sequences
+    nums = re.findall(r"\b(\d{1,3})\b", cleaned)
+    return set(int(n) for n in nums)
+
+
+def _filter_relatorio_questoes(docx_path: Path, keep_numbers: set[int]) -> bool:
+    """Edit a relatório docx to keep only the parecer of selected questions.
+
+    Strategy: open docx with python-docx, identify section headers like
+    'QUESTÃO N', 'Questão N', 'PARECER QUESTÃO N' etc., and remove paragraphs
+    belonging to questions NOT in keep_numbers.
+    """
+    try:
+        import docx as _docx
+        doc = _docx.Document(str(docx_path))
+
+        # Walk through paragraphs and group by current question
+        current_q = None
+        # Pattern matches headers: "QUESTÃO 10", "Questão 10", "10ª questão", "PARECER QUESTÃO 10"
+        question_header_re = re.compile(
+            r"(?i)(?:^|\b)(?:parecer\s+)?quest[ãa]o\s*[nNº°.:]*\s*(\d{1,3})"
+        )
+        # Track which paragraphs belong to which question
+        para_owner = []  # list aligned with doc.paragraphs
+        for p in doc.paragraphs:
+            txt = p.text.strip()
+            m = question_header_re.search(txt)
+            if m:
+                current_q = int(m.group(1))
+            para_owner.append(current_q)
+
+        # Now decide which paragraphs to remove
+        to_remove_idx = []
+        for i, owner in enumerate(para_owner):
+            if owner is not None and owner not in keep_numbers:
+                to_remove_idx.append(i)
+
+        if not to_remove_idx:
+            return False  # nothing changed
+
+        # Remove paragraphs in reverse to preserve indexes
+        for i in reversed(to_remove_idx):
+            p = doc.paragraphs[i]
+            elem = p._element
+            elem.getparent().remove(elem)
+
+        doc.save(str(docx_path))
+        return True
+    except Exception as e:
+        log.warning("Falha ao filtrar relatório %s: %s", docx_path.name, e)
+        return False
+
+
+def _convert_to_pdf(docx_path: Path, pdf_path: Path) -> bool:
+    """Convert DOCX to PDF using LibreOffice (soffice). Returns True on success."""
+    import subprocess
+    # Try to find soffice
+    soffice_candidates = [
+        "soffice",
+        "libreoffice",
+        "/usr/bin/soffice",
+        "/usr/bin/libreoffice",
+        "/opt/libreoffice/program/soffice",
+    ]
+    soffice_bin = None
+    for cand in soffice_candidates:
+        try:
+            r = subprocess.run([cand, "--version"], capture_output=True, timeout=5)
+            if r.returncode == 0:
+                soffice_bin = cand
+                break
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+    if not soffice_bin:
+        log.warning("LibreOffice não encontrado — conversão PDF indisponível")
+        return False
+
+    try:
+        out_dir = pdf_path.parent
+        result = subprocess.run(
+            [soffice_bin, "--headless", "--convert-to", "pdf",
+             "--outdir", str(out_dir), str(docx_path)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode != 0:
+            log.warning("soffice falhou: %s", result.stderr)
+            return False
+        # soffice creates the PDF with same basename
+        generated = out_dir / (docx_path.stem + ".pdf")
+        if generated.exists():
+            if generated != pdf_path:
+                generated.rename(pdf_path)
+            return True
+        return False
+    except Exception as e:
+        log.warning("Erro na conversão PDF: %s", e)
+        return False
+
+
 def process_zip(zip_path: Path, session_dir: Path, form_data: dict, api_key: str) -> dict:
     log.info("Pipeline start: %s", zip_path.name)
 
@@ -1047,6 +1181,14 @@ Observações: {form_data.get('obs','')}""")
     if ficha_estruturada:
         fe = ficha_estruturada
         auth_block = ["\n=== DADOS AUTORITATIVOS DO CLIENTE (extraídos da Ficha — USE EXATAMENTE ESTES VALORES) ==="]
+        auth_block.append(
+            "⚠️ ATENÇÃO ESPECIAL: O CLIENTE PODE MORAR EM UM ESTADO E PRESTAR CONCURSO EM OUTRO.\n"
+            "- A COMARCA refere-se à JURISDIÇÃO de endereçamento (geralmente domicílio do cliente).\n"
+            "- O CONCURSO é o do edital específico — pode ser de outro estado.\n"
+            "- NUNCA infira o estado do concurso a partir do endereço do cliente.\n"
+            "- Use SEMPRE o nome exato do concurso conforme a ficha (ex: PCES = Polícia Civil ES,\n"
+            "  PCMG = Polícia Civil MG, PCRJ = Polícia Civil RJ, etc.).\n"
+        )
         if fe.get("nome_cliente"):
             auth_block.append(f"NOME COMPLETO: {fe['nome_cliente']}")
         if fe.get("rg"):
@@ -1070,7 +1212,17 @@ Observações: {form_data.get('obs','')}""")
         if fe.get("comarca"):
             auth_block.append(f"COMARCA (de endereçamento): {fe['comarca']}")
         if fe.get("concurso"):
-            auth_block.append(f"CONCURSO: {fe['concurso']}")
+            auth_block.append(f"CONCURSO (nome completo): {fe['concurso']}")
+        if fe.get("sigla_concurso"):
+            auth_block.append(f"SIGLA DO CONCURSO: {fe['sigla_concurso']}")
+        if fe.get("instituicao_concurso"):
+            auth_block.append(f"INSTITUIÇÃO DO CONCURSO: {fe['instituicao_concurso']}")
+        if fe.get("estado_concurso"):
+            auth_block.append(f"ESTADO DO CONCURSO: {fe['estado_concurso']} ({fe.get('uf_concurso','')})")
+            auth_block.append(
+                f"⚠️ ATENÇÃO: O concurso é de {fe.get('uf_concurso','')} "
+                f"({fe['estado_concurso']}), NÃO infira outro estado a partir do endereço do cliente."
+            )
         if fe.get("banca"):
             auth_block.append(f"BANCA: {fe['banca']}")
         if fe.get("cargo"):
@@ -1148,6 +1300,26 @@ Observações: {form_data.get('obs','')}""")
         f"Identifique TODOS os trechos que se referem ao CLIENTE ANTIGO\n"
         f"(nome, RG, CPF, endereço, pontuação, banca, cargo, comarca, questões, etc.)\n"
         f"e gere pares de 'buscar' (texto antigo) → 'substituir' (valor correto da ficha).\n\n"
+        f"⚠️ ATENÇÃO ESPECIAL — CAPÍTULO DAS QUESTÕES ANULÁVEIS:\n"
+        f"O modelo possui um capítulo (geralmente intitulado 'DAS QUESTÕES ILEGAIS',\n"
+        f"'DA ILEGALIDADE DAS QUESTÕES' ou similar) com BLOCOS INDIVIDUAIS para cada\n"
+        f"questão antiga (ex: 'QUESTÃO 10 — ERRO GROSSEIRO', 'QUESTÃO 25 — ...').\n"
+        f"Você DEVE gerar pares de substituição para CADA bloco antigo, trocando-o\n"
+        f"pelo bloco correspondente da QUESTÃO NOVA do RELATÓRIO TÉCNICO.\n"
+        f"Exemplo:\n"
+        f"  buscar: 'QUESTÃO 10 — ERRO GROSSEIRO\\n[texto longo da questão antiga]'\n"
+        f"  substituir: 'QUESTÃO 1 — ERRO GROSSEIRO\\n[texto da questão nova baseado no relatório técnico]'\n"
+        f"\n"
+        f"REGRA: O número de questões na petição final DEVE ser EXATAMENTE o número\n"
+        f"de questões listadas em 'QUESTÕES A ANULAR' da ficha do cliente.\n"
+        f"Se a ficha lista 6 questões e o modelo tem 4, você DEVE gerar pares para\n"
+        f"trocar todas as 4 antigas pelas 4 primeiras novas, e ADICIONAR pares para\n"
+        f"inserir as 2 questões novas restantes (use um marcador como\n"
+        f"'\\nQUESTÃO_NOVA_INSERIDA: número | vício | resumo' que o sistema processará).\n"
+        f"\n"
+        f"⚠️ TAMBÉM no rol de pedidos finais, identifique a lista numérica das questões\n"
+        f"a anular (ex: 'declarar a nulidade das questões 10, 25, 31 e 34') e gere\n"
+        f"par de substituição com os números novos.\n\n"
         f"{modelo_text}"
     )
 
@@ -1301,9 +1473,43 @@ TEXTO DA PETIÇÃO ATUAL:
             if not dest.exists():
                 shutil.copy(fpath, dest)
 
+    # 8b. Filter relatórios técnicos: keep only questions in 'questoes_anular'
+    if ficha_estruturada and ficha_estruturada.get("questoes_anular"):
+        questoes_a_manter = _parse_question_numbers(ficha_estruturada["questoes_anular"])
+        log.info("Questões a manter no relatório: %s", questoes_a_manter)
+        for fpath in docx_relatorios:
+            delivery_path = delivery / fpath.name
+            if delivery_path.exists():
+                try:
+                    filtered = _filter_relatorio_questoes(delivery_path, questoes_a_manter)
+                    if filtered:
+                        changes.append(f"📝 Relatório '{fpath.name}' filtrado: mantidas questões {sorted(questoes_a_manter)}")
+                except Exception as e:
+                    log.warning("Falha ao filtrar relatório %s: %s", fpath.name, e)
+                    changes.append(f"⚠️ Não foi possível filtrar '{fpath.name}': {e}")
+
     # 9. Rename
     rol = data.get("rol_documentos", [])
     rename_map = rename_files_by_rol(delivery, rol) if rol else {}
+
+    # 9b. Convert petição DOCX to PDF
+    pdf_name = out_name.replace(".docx", ".pdf")
+    pdf_path = delivery / pdf_name
+    # Locate the renamed petição docx
+    docx_in_delivery = None
+    for f in delivery.iterdir():
+        if f.suffix.lower() == ".docx" and (f.name == out_name or "peticao" in f.name.lower()):
+            docx_in_delivery = f
+            break
+    if docx_in_delivery:
+        try:
+            if _convert_to_pdf(docx_in_delivery, pdf_path):
+                changes.append(f"📄 PDF gerado: {pdf_name}")
+            else:
+                changes.append(f"⚠️ Não foi possível gerar PDF (LibreOffice indisponível)")
+        except Exception as e:
+            log.warning("Falha na conversão PDF: %s", e)
+            changes.append(f"⚠️ Falha ao gerar PDF: {e}")
 
     # 10. Final zip
     zip_name = f"Entrega_{safe_nome}_{data_hoje}.zip"
