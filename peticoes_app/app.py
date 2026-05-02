@@ -26,11 +26,11 @@ app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 MB
 
 # ── Token budget ─────────────────────────────────────────────────────────────
 MAX_CHARS_PER_PDF      = 1_500   # reduced for memory
-MAX_CHARS_PER_XLSX     = 2_000
-MAX_CHARS_DOCX_MODEL   = 2_500
+MAX_CHARS_PER_XLSX     = 2_500
+MAX_CHARS_DOCX_MODEL   = 50_000  # send full modelo for find/replace
 MAX_CHARS_DOCX_OTHER   = 1_500
 MAX_PDFS               = 3       # reduced for memory
-TOTAL_CHAR_BUDGET      = 25_000  # reduced for memory
+TOTAL_CHAR_BUDGET      = 130_000  # raised: full modelo + ficha + relatórios
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -223,7 +223,33 @@ e gerar um JSON estruturado para preenchimento da Petição Inicial em modelo .d
 - Todas as informações do candidato devem refletir os documentos do cliente atual,
   em substituição completa aos dados que constam no modelo.
 
-═══ FORMATO DE RESPOSTA ═══
+═══ SUBSTITUIÇÃO DOS DADOS DO CLIENTE NO MODELO ═══
+
+O modelo da petição vem com dados de um CLIENTE ANTIGO escritos diretamente no texto.
+Sua tarefa MAIS IMPORTANTE é identificar todos esses trechos e gerar pares
+"buscar → substituir" para que o sistema faça a troca automaticamente.
+
+Inclua no array "substituicoes" do JSON pares para TODOS os dados que mudam, como:
+- Nome completo do cliente antigo → nome do cliente novo
+- Estado civil, profissão, RG, CPF do cliente antigo → do novo
+- Endereço completo do cliente antigo → endereço novo
+- Pontuação obtida (ex: "55 pontos") → pontuação real do novo cliente
+- Pontuação após anulação (ex: "59 pts") → pontuação projetada do novo cliente
+- Nota de corte se diferente (ex: "58 pontos") → nota de corte real
+- Comarca (ex: "BARRA DE SÃO FRANCISCO/ES") → comarca do novo cliente
+- Cargo (ex: "Oficial Investigador de Polícia") → cargo se diferente
+- Banca examinadora se diferente
+- Tipo de prova (ex: "Prova Tipo 2") → tipo de prova do novo cliente
+- Números de questões antigas (ex: "questões 10, 25, 31 e 34") → questões reais
+- Quaisquer outros dados específicos do caso antigo
+
+REGRAS PARA OS PARES:
+- "buscar": deve ser TEXTO LITERAL exato do modelo (copie como aparece, com
+  acentos, maiúsculas e pontuação iguais).
+- "substituir": deve ser o texto novo correspondente.
+- Inclua o suficiente do contexto para ser único (evite buscar palavras isoladas).
+- Use múltiplos pares pequenos em vez de um só gigante (mais fácil de localizar).
+- Se um dado se repete no modelo, basta UM par — o sistema substitui todas as ocorrências.
 
 JSON PURO (sem markdown, sem backticks, sem texto antes ou depois).
 REGRAS CRÍTICAS PARA O JSON:
@@ -277,6 +303,10 @@ Schema:
     }
   ],
   "questao_destaque_idx": 0,
+  "substituicoes": [
+    {"buscar": "ADLER MARQUES DE LIMA", "substituir": "NOME DO NOVO CLIENTE"},
+    {"buscar": "55 pontos", "substituir": "60 pontos"}
+  ],
   "textos": {
     "fatos": "",
     "pontuacao": "",
@@ -393,53 +423,138 @@ def call_claude(api_key: str, full_text: str) -> dict:
 # ── DOCX editing ──────────────────────────────────────────────────────────────
 
 def apply_substitutions(unpacked_dir: Path, data: dict) -> list[str]:
-    doc_xml_path = unpacked_dir / "word" / "document.xml"
-    if not doc_xml_path.exists():
-        return ["ERRO: document.xml não encontrado"]
-
-    xml = doc_xml_path.read_text(encoding="utf-8")
+    """Apply find/replace pairs from Claude across XML and headers/footers."""
     changes = []
-    c = data.get("cliente", {})
+
+    # Files to edit: document.xml + headers + footers
+    word_dir = unpacked_dir / "word"
+    files_to_edit = []
+    if (word_dir / "document.xml").exists():
+        files_to_edit.append(word_dir / "document.xml")
+    for f in word_dir.glob("header*.xml"):
+        files_to_edit.append(f)
+    for f in word_dir.glob("footer*.xml"):
+        files_to_edit.append(f)
+
+    if not files_to_edit:
+        return ["ERRO: nenhum XML editável encontrado"]
+
+    # Get find/replace pairs from Claude response
+    pairs = data.get("substituicoes", [])
+    if not pairs:
+        changes.append("⚠️ Nenhum par de substituição retornado pelo Claude")
+
+    # Apply each pair across all XML files
+    for pair in pairs:
+        old = pair.get("buscar", "").strip()
+        new = pair.get("substituir", "").strip()
+        if not old or old == new:
+            continue
+
+        old_xe = xe(old)
+        new_xe = xe(new)
+        total_count = 0
+
+        for xml_path in files_to_edit:
+            xml = xml_path.read_text(encoding="utf-8")
+
+            # Try literal XML-escaped match first
+            count = xml.count(old_xe)
+            if count > 0:
+                xml = xml.replace(old_xe, new_xe)
+                total_count += count
+                xml_path.write_text(xml, encoding="utf-8")
+                continue
+
+            # Fallback: try matching across XML run boundaries
+            # Word splits text into <w:t>...</w:t> chunks; reconstruct visible text
+            new_xml = _replace_across_runs(xml, old, new)
+            if new_xml != xml:
+                xml_path.write_text(new_xml, encoding="utf-8")
+                total_count += 1
+
+        if total_count > 0:
+            changes.append(f"✅ '{old[:40]}...' → '{new[:40]}...' ({total_count}x)")
+        else:
+            changes.append(f"⚠️ Não encontrado: '{old[:60]}...'")
+
+    # Remove gratuidade chapter if not applicable
     p = data.get("processo", {})
-    t = data.get("textos", {})
-
-    substitutions = [
-        ("NOME_COMPLETO_CLIENTE",   c.get("nome_completo", "[DADO AUSENTE — Nome]")),
-        ("QUALIFICACAO_CLIENTE",    _build_qualificacao(c)),
-        ("CPF_CLIENTE",             c.get("cpf", "[DADO AUSENTE — CPF]")),
-        ("RG_CLIENTE",              c.get("rg", "[DADO AUSENTE — RG]")),
-        ("EMAIL_CLIENTE",           c.get("email", "[DADO AUSENTE — E-mail]")),
-        ("ENDERECO_CLIENTE",        _build_endereco(c)),
-        ("CIDADE_CLIENTE",          c.get("cidade", "[DADO AUSENTE — Cidade]")),
-        ("UF_CLIENTE",              c.get("uf", "[DADO AUSENTE — UF]")),
-        ("COMARCA_JUIZO",           p.get("comarca", "[DADO AUSENTE — Comarca]")),
-        ("TIPO_ACAO",               p.get("tipo_acao", "")),
-        ("NOME_BANCA",              p.get("banca", "[DADO AUSENTE — Banca]")),
-        ("NOME_CONCURSO",           p.get("concurso", "[DADO AUSENTE — Concurso]")),
-        ("CARGO_PRETENDIDO",        p.get("cargo", "[DADO AUSENTE — Cargo]")),
-        ("PONTUACAO_OBTIDA",        str(p.get("pontuacao_obtida", "[DADO AUSENTE]"))),
-        ("PONTUACAO_CORTE",         str(p.get("pontuacao_corte", "[DADO AUSENTE]"))),
-        ("PONTUACAO_APOS_ANULACAO", str(p.get("pontuacao_apos_anulacao", "[DADO AUSENTE]"))),
-    ]
-
-    for placeholder, value in substitutions:
-        if placeholder in xml:
-            xml = xml.replace(placeholder, xe(value))
-            changes.append(f"✅ {placeholder}")
-
-    xml = _replace_block(xml, "BLOCO_FATOS",                 t.get("fatos", ""), changes)
-    xml = _replace_block(xml, "BLOCO_PONTUACAO",             t.get("pontuacao", ""), changes)
-    xml = _replace_block(xml, "BLOCO_PROBABILIDADE_DIREITO", t.get("probabilidade_direito", ""), changes)
-    xml = _replace_block(xml, "BLOCO_FUNDAMENTOS",           t.get("fundamentos_juridicos", ""), changes)
-    xml = _insert_questoes(xml, data.get("questoes", []), changes)
-
     if not p.get("gratuidade", True):
-        xml, removed = _remove_gratuidade_chapter(xml)
-        if removed:
-            changes.append("🗑️ Capítulo de gratuidade removido")
+        for xml_path in files_to_edit:
+            xml = xml_path.read_text(encoding="utf-8")
+            new_xml, removed = _remove_gratuidade_chapter(xml)
+            if removed:
+                xml_path.write_text(new_xml, encoding="utf-8")
+                changes.append("🗑️ Capítulo de gratuidade removido")
+                break
 
-    doc_xml_path.write_text(xml, encoding="utf-8")
     return changes
+
+
+def _replace_across_runs(xml: str, old: str, new: str) -> str:
+    """Try to replace text that may be split across multiple <w:t> elements."""
+    # Build a map of positions where text would render
+    # Strategy: find the visible text, locate it, and replace at the run level
+    if not old:
+        return xml
+
+    # Extract all visible text spans
+    pattern = re.compile(r'<w:t[^>]*>([^<]*)</w:t>', re.DOTALL)
+    matches = list(pattern.finditer(xml))
+    if not matches:
+        return xml
+
+    # Build concatenated text and position map
+    concat = ""
+    positions = []  # (start_in_concat, end_in_concat, match_idx)
+    for i, m in enumerate(matches):
+        text = m.group(1)
+        start = len(concat)
+        concat += text
+        positions.append((start, start + len(text), i))
+
+    # Find old text in concatenated visible text
+    idx = concat.find(old)
+    if idx < 0:
+        return xml
+
+    end_idx = idx + len(old)
+
+    # Identify runs that overlap [idx, end_idx)
+    affected = [(s, e, i) for (s, e, i) in positions if not (e <= idx or s >= end_idx)]
+    if not affected:
+        return xml
+
+    # Build new XML: replace text in first affected run with new value,
+    # blank out other affected runs
+    new_xml_parts = []
+    last_pos = 0
+    for j, m in enumerate(matches):
+        new_xml_parts.append(xml[last_pos:m.start()])
+        affected_idxs = [a[2] for a in affected]
+        if j == affected[0][2]:
+            # First affected: write the prefix + new value + suffix
+            run_start, run_end, _ = positions[j]
+            prefix = m.group(1)[:max(0, idx - run_start)]
+            suffix = m.group(1)[max(0, end_idx - run_start):] if run_end > end_idx else ""
+            new_text = prefix + new + suffix
+            new_xml_parts.append(f'<w:t xml:space="preserve">{xe(new_text)}</w:t>')
+        elif j in affected_idxs:
+            # Other affected runs: keep tag but empty text
+            run_start, run_end, _ = positions[j]
+            if run_end <= end_idx:
+                new_xml_parts.append('<w:t xml:space="preserve"></w:t>')
+            else:
+                # Partial: keep what's after end_idx
+                suffix = m.group(1)[end_idx - run_start:]
+                new_xml_parts.append(f'<w:t xml:space="preserve">{xe(suffix)}</w:t>')
+        else:
+            new_xml_parts.append(m.group(0))
+        last_pos = m.end()
+    new_xml_parts.append(xml[last_pos:])
+    return "".join(new_xml_parts)
+
 
 def _build_qualificacao(c: dict) -> str:
     parts = []
@@ -657,9 +772,16 @@ Observações: {form_data.get('obs','')}""")
         rname = fpath.relative_to(extract_dir)
         add(f"\n=== PDF: {rname} ===", extract_pdf_text(fpath), MAX_CHARS_PER_PDF)
 
-    # Modelo docx — skeleton only (placeholders)
-    add(f"\n=== MODELO DOCX: {docx_model.name} (esqueleto) ===",
-        read_docx_text(docx_model, MAX_CHARS_DOCX_MODEL), MAX_CHARS_DOCX_MODEL)
+    # Modelo docx — send the FULL TEXT so Claude can identify what to replace
+    modelo_text = read_docx_text(docx_model, max_chars=50_000)  # full modelo
+    parts.append(
+        f"\n=== MODELO DA PETIÇÃO (texto integral) — arquivo: {docx_model.name} ===\n"
+        f"ATENÇÃO: Identifique TODOS os trechos do modelo abaixo que se referem ao CLIENTE ANTIGO\n"
+        f"(nome, RG, CPF, endereço, pontuação, número do edital, banca, cargo, comarca, etc.)\n"
+        f"e gere pares de 'buscar' (texto antigo) → 'substituir' (texto novo do cliente atual)\n"
+        f"no campo 'substituicoes' do JSON. Inclua TAMBÉM o tipo de ação se for diferente.\n\n"
+        f"{modelo_text}"
+    )
 
     full_text = "\n\n".join(parts)
     log.info("Text block: %d chars (budget: %d)", len(full_text), TOTAL_CHAR_BUDGET)
