@@ -264,8 +264,14 @@ async function submitForm(){
     logLine('🚀 Arquivo enviado. Aguardando Claude...');
     const res=await fetch('/gerar',{method:'POST',body:fd});
     prog(75,'Recebendo resposta...');
-    logLine('📥 Resposta recebida.');
-    const data=await res.json();
+    logLine('📥 Resposta recebida (HTTP '+res.status+').');
+    const raw=await res.text();
+    let data;
+    try{ data=JSON.parse(raw); }
+    catch(je){
+      showErr('O servidor retornou uma resposta inesperada (HTTP '+res.status+'). Verifique os logs do Render.\n\nDetalhe: '+raw.substring(0,300));
+      return;
+    }
     if(data.error){showErr(data.error);return;}
     prog(100,'✅ Concluído!');
     logLine('✅ Petição gerada: '+data.docx_filename);
