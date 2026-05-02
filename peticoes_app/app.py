@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 # ── VERSION MARKER — change this every release to confirm deploy ──────────
-APP_VERSION = "v36-2026-05-02-pontuacao-variacoes"
+APP_VERSION = "v37-2026-05-02-corte-preservado-ordem-pares"
 log.info("=" * 70)
 log.info("🚀 SilvaPinto GeradorPeticoes %s INICIANDO", APP_VERSION)
 log.info("=" * 70)
@@ -854,12 +854,26 @@ def apply_substitutions(unpacked_dir: Path, data: dict, ficha: dict | None = Non
         # numeric scores in the model (0-100 range) and, for those that DO NOT
         # match the new ficha values, generates substitution pairs covering
         # common Portuguese legal-text variations.
+        #
+        # CRITICAL: do not change values that are clearly the "nota de corte"
+        # (cutoff score) unless the ficha provides a new cutoff. The user's
+        # rule: only change a value if the ficha gives a new one; otherwise
+        # KEEP THE MODEL value.
         if pont_obtida and pont_final:
             try:
                 obt_int = int(float(str(pont_obtida).replace(",", ".").split()[0]))
                 fin_int = int(float(str(pont_final).replace(",", ".").split()[0]))
             except (ValueError, IndexError):
                 obt_int = fin_int = None
+
+            # Try to extract cutoff (nota de corte) from ficha, if present.
+            corte_raw = ficha.get("nota_corte") or ""
+            corte_int = None
+            if corte_raw:
+                try:
+                    corte_int = int(float(str(corte_raw).replace(",", ".").split()[0]))
+                except (ValueError, IndexError):
+                    corte_int = None
 
             if obt_int is not None and fin_int is not None:
                 doc_xml_path = unpacked_dir / "word" / "document.xml"
@@ -868,55 +882,112 @@ def apply_substitutions(unpacked_dir: Path, data: dict, ficha: dict | None = Non
                     text_now = re.sub(r"<[^>]+>", " ", xml_now)
                     text_now = re.sub(r"\s+", " ", text_now)
 
-                    # Find all distinct numeric scores in pattern "N pontos" or "N pts" (0-100)
-                    score_pat = re.compile(
-                        r"\b(\d{1,3})\s*(?:\(([^)]+)\)\s*)?(pontos?|pts?)\b",
+                    # ── Identify which numbers in the model represent CUTOFF scores
+                    # so we don't misclassify them as "old obtained/final".
+                    # Heuristic: a number is likely a cutoff if it appears within
+                    # ~50 chars of phrases like "nota de corte", "fixada em",
+                    # "pontuação mínima", "corte do certame".
+                    cutoff_pat = re.compile(
+                        r"(nota\s+de\s+corte|pontuação\s+mínima|corte\s+do\s+certame|"
+                        r"fixada\s+em|m[ií]nimo\s+de|m[ií]nimo\s+exigido)"
+                        r"[^.]{0,60}?\b(\d{1,3})\s*(?:\([^)]+\)\s*)?p(?:ontos?|ts?)\b",
                         re.IGNORECASE,
                     )
+                    cutoff_scores_in_model = set()
+                    for m in cutoff_pat.finditer(text_now):
+                        try:
+                            cutoff_scores_in_model.add(int(m.group(2)))
+                        except ValueError:
+                            continue
+
+                    # Also: any number near "fixada em" or "pontuação mínima"
+                    # (broader pattern)
+                    near_pat = re.compile(
+                        r"\b(\d{1,3})\s*(?:\([^)]+\)\s*)?p(?:ontos?|ts?)\b",
+                        re.IGNORECASE,
+                    )
+
+                    # Find all distinct numeric scores in pattern "N pontos" or "N pts" (0-100)
                     seen_scores = set()
-                    for m in score_pat.finditer(text_now):
+                    for m in near_pat.finditer(text_now):
                         try:
                             n = int(m.group(1))
                         except ValueError:
                             continue
-                        if not (0 <= n <= 100):
+                        # Filter: scores below 5 are likely "differential points"
+                        # (e.g., "diferença de 03 pontos") not actual exam scores.
+                        # Real concurso cutoff/score values are typically >= 30.
+                        # Using 5 as a safe lower bound to avoid catching 1-3 point
+                        # differentials that appear in legal text like "diferença
+                        # mínima de 03 pontos".
+                        if not (5 <= n <= 100):
                             continue
                         # If already correct (matches ficha), skip
                         if n == obt_int or n == fin_int:
                             continue
                         seen_scores.add(n)
 
+                    # Remove cutoff values from candidates UNLESS the ficha
+                    # gave us a new cutoff (corte_int). If ficha has no cutoff,
+                    # we KEEP the model's cutoff value untouched.
+                    if corte_int is None:
+                        # Remove model's cutoff scores from substitution candidates
+                        seen_scores -= cutoff_scores_in_model
+                        if cutoff_scores_in_model:
+                            log.info(
+                                "Auto-pares pontuação: preservando nota(s) de corte do "
+                                "modelo %s (ficha não informa nova nota de corte)",
+                                sorted(cutoff_scores_in_model)
+                            )
+
                     # For each old score, decide if it maps to obt_int or fin_int.
-                    # Heuristic: the smaller old score → obt_int (current),
-                    # the larger old score → fin_int (after anulações).
-                    # If only one old score, map to obt_int (most common case).
+                    # Heuristic: smaller scores → obtained (current); larger → final.
+                    # We use a simple split: scores below the median map to obtida,
+                    # scores at-or-above the median map to final.
+                    # If only one score, default to obtida.
                     sorted_old = sorted(seen_scores)
                     mapping = {}
-                    if len(sorted_old) >= 2:
-                        # Smaller → pontuação obtida atual; maior → final calculada
+                    if len(sorted_old) == 1:
+                        mapping[sorted_old[0]] = obt_int
+                    elif len(sorted_old) >= 2:
+                        # Use the gap between obt_int and fin_int as reference.
+                        # Scores closer to "low end" → obt_int; closer to "high end" → fin_int.
+                        mid = (obt_int + fin_int) / 2
+                        # But since we don't know each old score's role, use position:
+                        # smallest → obt, largest → fin, middle ones → obt (conservative,
+                        # since most are "current score" references)
                         mapping[sorted_old[0]] = obt_int
                         mapping[sorted_old[-1]] = fin_int
-                        # Middle values get mapped to obt_int (conservative)
                         for n in sorted_old[1:-1]:
-                            mapping[n] = obt_int
-                    elif len(sorted_old) == 1:
-                        mapping[sorted_old[0]] = obt_int
+                            # Middle values: closer to fin_int's end of range → fin_int,
+                            # else → obt_int. This handles cases where multiple "current"
+                            # or "final" scores appear.
+                            if abs(n - fin_int) < abs(n - obt_int):
+                                mapping[n] = fin_int
+                            else:
+                                mapping[n] = obt_int
 
-                    # Generate variation pairs for each mapping
+                    # If ficha provided a new cutoff, generate pairs to update
+                    # the model's cutoff values to the new one.
+                    if corte_int is not None:
+                        for old_corte in cutoff_scores_in_model:
+                            if old_corte != corte_int and old_corte not in mapping:
+                                mapping[old_corte] = corte_int
+
+                    # Generate variation pairs for each mapping.
+                    # IMPORTANT: do NOT generate "X ponto" or "X pt" (singular)
+                    # variations — they are prefixes of "X pontos"/"X pts" and
+                    # cause partial matches like "58 ponto" matching inside
+                    # "58 pontos", leaving "s" sobrando ("66 pontoss").
                     for old_n, new_n in mapping.items():
                         old_ext = _num_extenso(old_n)
                         new_ext = _num_extenso(new_n)
-                        # Variations to cover common forms in legal text.
-                        # Each variation: (template_old, template_new)
                         variations = [
                             # "55 pontos" → "66 pontos"
                             (f"{old_n} pontos", f"{new_n} pontos"),
-                            (f"{old_n} ponto", f"{new_n} pontos"),
                             (f"{old_n} pts", f"{new_n} pts"),
-                            (f"{old_n} pt", f"{new_n} pts"),
-                            # "55 (cinquenta e cinco) pontos" → "66 (sessenta e seis) pontos"
+                            # "55 (cinquenta e cinco) pontos"
                             (f"{old_n} ({old_ext}) pontos", f"{new_n} ({new_ext}) pontos"),
-                            (f"{old_n} ({old_ext}) ponto",  f"{new_n} ({new_ext}) pontos"),
                             (f"{old_n} ({old_ext}) pts",    f"{new_n} ({new_ext}) pts"),
                             # Caps versions
                             (f"{old_n} PONTOS", f"{new_n} PONTOS"),
@@ -982,6 +1053,12 @@ def apply_substitutions(unpacked_dir: Path, data: dict, ficha: dict | None = Non
                                 )
                         except ValueError:
                             continue
+
+    # Sort pairs by 'buscar' length descending. Longer patterns must be applied
+    # FIRST, otherwise shorter patterns (like '59 PONTOS') match inside longer
+    # ones (like 'DE 55 PARA 59 PONTOS') and break them up. We preserve the
+    # original order among pairs of equal length using a stable sort.
+    pairs = sorted(pairs, key=lambda p: -len(p.get("buscar", "") or ""))
 
     log.info("Total de substituições a aplicar: %d", len(pairs))
     if not pairs:
@@ -2387,9 +2464,23 @@ Observações: {form_data.get('obs','')}""")
             "\n"
             "🛑 REGRA Nº 5: NÃO crie pares de substituição para os blocos do capítulo\n"
             "'DO ROL DE QUESTÕES ILEGAIS' — o sistema reescreve esse capítulo automaticamente\n"
-            "a partir dos relatórios técnicos.\n".format(
+            "a partir dos relatórios técnicos.\n"
+            "\n"
+            "🛑 REGRA Nº 6 (NOTA DE CORTE — atenção especial):\n"
+            "A nota de corte é um valor que pertence ao CONCURSO, não ao cliente. \n"
+            "{corte_status}\n"
+            "Se o modelo diz 'nota de corte de 58 pontos', e a ficha NÃO tem nota de corte,\n"
+            "DEIXE como está. Não invente. Não troque por outro número da ficha (como a\n"
+            "pontuação obtida ou a final). Confunde a petição.\n".format(
                 est=fe.get("estado_concurso") or "(estado do concurso)",
                 inst=fe.get("instituicao_concurso") or "(instituição do concurso)",
+                corte_status=(
+                    f"A ficha INFORMA a nota de corte: {fe.get('nota_corte')}. Use esta."
+                    if fe.get("nota_corte")
+                    else "A ficha NÃO informa a nota de corte. Portanto: MANTENHA o valor\n"
+                         "que o modelo já tem (qualquer número que apareça com 'nota de corte',\n"
+                         "'pontuação mínima', 'fixada em N pontos', 'corte do certame')."
+                ),
             )
         )
         parts.append("\n".join(auth_block))
