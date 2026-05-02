@@ -965,49 +965,70 @@ def process_zip(zip_path: Path, session_dir: Path, form_data: dict, api_key: str
     file_list = [str(f.relative_to(extract_dir)) for f in all_files]
     log.info("Files: %s", file_list)
 
-    # 2. Classify
-    model_keywords  = ("modelo", "peticao", "petição", "inicial")
-    report_keywords = ("relatorio", "relatório", "questao", "questão", "tecnico", "parecer", "fundamentacao")
-    id_keywords     = ("rg", "cpf", "procuracao", "identidade", "comprovante", "cnh", "habilitacao")
+    # 2. Classify — apenas 4 categorias relevantes para a IA:
+    #    (a) modelo da petição (.docx)
+    #    (b) ficha do cliente (.xlsx)
+    #    (c) procuração (.pdf) — para backup dos dados pessoais
+    #    (d) relatórios técnicos das questões (.docx)
+    # Todos os outros arquivos vão para "outros_arquivos" — entram no ZIP final
+    # mas NÃO são lidos pela IA, economizando tokens e custos.
+
+    model_keywords      = ("modelo", "peticao", "petição", "inicial")
+    relatorio_keywords  = ("relatorio", "relatório", "questao", "questão",
+                           "questoes", "questões", "parecer", "tecnico", "técnico",
+                           "fundamentacao", "fundamentação")
+    procuracao_keywords = ("procuracao", "procuração", "procuracoes", "procurações")
+    ficha_keywords      = ("ficha",)
 
     docx_model = None
-    other_docx = []
-    pdfs_report = []
-    pdfs_id = []
-    text_files = []
+    docx_relatorios = []
+    pdf_procuracao = None
+    xlsx_ficha = None
+    outros_arquivos = []  # vão pro ZIP mas não são lidos
 
     for fpath in all_files:
         nl = fpath.name.lower()
         if nl.endswith(".docx"):
             if any(k in nl for k in model_keywords):
                 docx_model = fpath
+            elif any(k in nl for k in relatorio_keywords):
+                docx_relatorios.append(fpath)
             else:
-                other_docx.append(fpath)
+                outros_arquivos.append(fpath)
         elif nl.endswith(".pdf"):
-            if any(k in nl for k in id_keywords):
-                pdfs_id.append(fpath)
+            if any(k in nl for k in procuracao_keywords):
+                if pdf_procuracao is None:  # primeira procuração encontrada
+                    pdf_procuracao = fpath
+                else:
+                    outros_arquivos.append(fpath)
             else:
-                pdfs_report.append(fpath)
-        elif nl.endswith((".xlsx", ".xls", ".csv", ".txt")):
-            text_files.append(fpath)
+                outros_arquivos.append(fpath)
+        elif nl.endswith((".xlsx", ".xls")):
+            if any(k in nl for k in ficha_keywords):
+                if xlsx_ficha is None:
+                    xlsx_ficha = fpath
+                else:
+                    outros_arquivos.append(fpath)
+            else:
+                outros_arquivos.append(fpath)
+        else:
+            outros_arquivos.append(fpath)
 
-    if not docx_model and other_docx:
-        docx_model = other_docx.pop(0)
+    log.info(
+        "Classificação: modelo=%s, ficha=%s, procuração=%s, relatórios=%d, "
+        "outros (não lidos)=%d",
+        docx_model.name if docx_model else "AUSENTE",
+        xlsx_ficha.name if xlsx_ficha else "AUSENTE",
+        pdf_procuracao.name if pdf_procuracao else "AUSENTE",
+        len(docx_relatorios),
+        len(outros_arquivos),
+    )
+
     if not docx_model:
         return {"error": "Nenhum arquivo .docx modelo encontrado no ZIP."}
 
-    # 3. Build text block — ALL text, NO binary PDFs
+    # 3. Build text block — apenas as 4 fontes essenciais
     parts = []
-    char_used = 0
-
-    def add(section: str, content: str, cap: int):
-        nonlocal char_used
-        remaining = TOTAL_CHAR_BUDGET - char_used
-        if remaining <= 100:
-            return
-        snip = truncate(content, min(cap, remaining))
-        parts.append(section + "\n" + snip)
-        char_used += len(snip)
 
     parts.append("=== INVENTÁRIO DO ZIP ===\n" + "\n".join(f"  • {f}" for f in file_list))
     parts.append(f"""=== DADOS FORNECIDOS PELO USUÁRIO ===
@@ -1016,16 +1037,13 @@ Comarca: {form_data.get('comarca','')}
 Resumo dos Fatos: {form_data.get('fatos','')}
 Pedidos Adicionais: {form_data.get('pedidos','')}
 Observações: {form_data.get('obs','')}""")
-    char_used = sum(len(p) for p in parts)
 
-    # Text files first (ficha xlsx — most critical)
-    # Parse ficha into structured data first, then inject as authoritative
+    # ─── FONTE 1/4: FICHA DO CLIENTE (XLSX) ────────────────────────────────────
+    # Parsing estruturado + bloco de dados autoritativos
     ficha_estruturada = {}
-    for fpath in text_files:
-        if fpath.suffix.lower() in (".xlsx", ".xls") and "ficha" in fpath.name.lower():
-            ficha_estruturada = parse_ficha_cliente(fpath)
-            break
-    # If ficha was found, build authoritative block FIRST
+    if xlsx_ficha:
+        ficha_estruturada = parse_ficha_cliente(xlsx_ficha)
+
     if ficha_estruturada:
         fe = ficha_estruturada
         auth_block = ["\n=== DADOS AUTORITATIVOS DO CLIENTE (extraídos da Ficha — USE EXATAMENTE ESTES VALORES) ==="]
@@ -1058,16 +1076,16 @@ Observações: {form_data.get('obs','')}""")
         if fe.get("cargo"):
             auth_block.append(f"CARGO: {fe['cargo']}")
         else:
-            auth_block.append("CARGO: [NÃO INFORMADO — manter o do modelo ou marcar [DADO AUSENTE]]")
+            auth_block.append("CARGO: [NÃO INFORMADO — manter o do modelo]")
         if fe.get("tipo_prova"):
             auth_block.append(f"TIPO DE PROVA: Tipo {fe['tipo_prova'].replace('Tipo','').strip()}")
         if fe.get("pontuacao_obtida"):
-            auth_block.append(f"PONTUAÇÃO OBTIDA pelo cliente: {fe['pontuacao_obtida']}")
+            auth_block.append(f"PONTUAÇÃO OBTIDA: {fe['pontuacao_obtida']}")
         if fe.get("delta_anulacao"):
-            auth_block.append(f"GANHO COM AS ANULAÇÕES (delta — NÃO É O TOTAL FINAL): {fe['delta_anulacao']}")
+            auth_block.append(f"GANHO COM AS ANULAÇÕES (delta — NÃO É O TOTAL): {fe['delta_anulacao']}")
         if fe.get("pontuacao_final_calculada"):
             auth_block.append(
-                f"⚠️ PONTUAÇÃO FINAL APÓS ANULAÇÕES (TOTAL — USE ESTE VALOR): "
+                f"⚠️ PONTUAÇÃO FINAL APÓS ANULAÇÕES (TOTAL): "
                 f"{fe['pontuacao_final_calculada']}"
             )
         if fe.get("nota_corte"):
@@ -1077,77 +1095,71 @@ Observações: {form_data.get('obs','')}""")
         if fe.get("questoes_anular"):
             auth_block.append(f"QUESTÕES A ANULAR: {fe['questoes_anular']}")
         if fe.get("gratuidade"):
-            auth_block.append(f"REQUER GRATUIDADE DE JUSTIÇA: {fe['gratuidade']}")
+            auth_block.append(f"REQUER GRATUIDADE: {fe['gratuidade']}")
         if fe.get("eliminado"):
             auth_block.append(f"AUTOR ELIMINADO?: {fe['eliminado']}")
         if fe.get("tipo_acao"):
             auth_block.append(f"TIPO DE AÇÃO: {fe['tipo_acao']}")
         if fe.get("resumo_fatos"):
-            auth_block.append(f"RESUMO DOS FATOS (cliente): {fe['resumo_fatos']}")
+            auth_block.append(f"RESUMO DOS FATOS: {fe['resumo_fatos']}")
         auth_block.append(
             "\n⚠️ REGRA CRÍTICA: TODOS os pares de 'substituicoes' DEVEM usar EXATAMENTE os valores acima.\n"
-            "- Para a pontuação final, use SEMPRE o valor calculado acima — NUNCA invente outro número.\n"
-            "- Para a comarca, use SEMPRE o valor calculado acima (ex: 'MATIPÓ/MG').\n"
-            "- Se um campo está marcado como [NÃO INFORMADO], NÃO crie par de substituição para ele —\n"
-            "  mantenha o valor do modelo intacto.\n"
+            "- Pontuação final: use o valor calculado acima — NUNCA invente outro número.\n"
+            "- Comarca: use o valor calculado acima.\n"
+            "- Se um campo está [NÃO INFORMADO], NÃO crie par de substituição — mantenha o do modelo.\n"
         )
         parts.append("\n".join(auth_block))
 
-    for fpath in text_files:
-        rname = fpath.relative_to(extract_dir)
-        add(f"\n=== TEXTO: {rname} ===", read_text_file(fpath), MAX_CHARS_PER_XLSX)
+    # Texto bruto da ficha (backup, caso o parser tenha perdido algo)
+    if xlsx_ficha:
+        parts.append(
+            f"\n=== FICHA DO CLIENTE (texto bruto — backup) — arquivo: {xlsx_ficha.name} ===\n"
+            + read_text_file(xlsx_ficha)
+        )
 
-    # Other DOCX — separate "relatórios técnicos" (questões) from outros docx
-    relatorio_keywords = ("relatorio", "relatório", "questao", "questão",
-                          "questoes", "questões", "tecnico", "técnico",
-                          "parecer", "fundamentacao", "fundamentação")
-    relatorios_docx = []
-    outros_docx = []
-    for fpath in other_docx:
-        nl = fpath.name.lower()
-        if any(k in nl for k in relatorio_keywords):
-            relatorios_docx.append(fpath)
-        else:
-            outros_docx.append(fpath)
+    # ─── FONTE 2/4: PROCURAÇÃO (PDF) — backup de dados pessoais ──────────────
+    if pdf_procuracao:
+        proc_text = extract_pdf_text(pdf_procuracao, max_chars=10_000)
+        parts.append(
+            f"\n=== PROCURAÇÃO — arquivo: {pdf_procuracao.name} ===\n"
+            f"Use APENAS para confirmar dados pessoais (nome, CPF, RG, endereço) "
+            f"caso a ficha esteja incompleta.\n\n"
+            f"{proc_text}"
+        )
 
-    # Relatórios técnicos com prioridade — sem truncamento agressivo
-    for fpath in relatorios_docx:
+    # ─── FONTE 3/4: RELATÓRIOS TÉCNICOS DAS QUESTÕES ─────────────────────────
+    for fpath in docx_relatorios:
         rname = fpath.relative_to(extract_dir)
-        full_relat = read_docx_text(fpath, max_chars=200_000)  # full report
+        full_relat = read_docx_text(fpath, max_chars=200_000)
         parts.append(
             f"\n=== RELATÓRIO TÉCNICO DAS QUESTÕES — arquivo: {rname} ===\n"
-            f"ATENÇÃO: Este arquivo contém os pareceres técnicos das questões impugnáveis.\n"
-            f"Identifique cada questão (pelo número), seu vício, e o resumo da fundamentação.\n"
-            f"Para CADA questão que está na lista de 'Questões a Anular' da ficha do cliente,\n"
-            f"gere um par de substituição que TROQUE o resumo da questão antiga (no modelo)\n"
-            f"pelo resumo da questão nova (deste relatório).\n"
-            f"E em 'questoes' do JSON, popule número, vício, resumo_peticao, enunciado e relatorio_integra.\n\n"
+            f"Identifique cada questão (pelo número), seu vício e a fundamentação.\n"
+            f"Para CADA questão na lista 'QUESTÕES A ANULAR' da ficha, gere um par\n"
+            f"de substituição que troque o resumo da questão antiga (do modelo) pelo\n"
+            f"resumo da questão nova (deste relatório).\n"
+            f"Em 'questoes' do JSON, popule número, vício, resumo_peticao, enunciado e relatorio_integra.\n\n"
             f"{full_relat}"
         )
 
-    # Outros DOCX (não-relatórios)
-    for fpath in outros_docx:
-        rname = fpath.relative_to(extract_dir)
-        add(f"\n=== DOCX: {rname} ===", read_docx_text(fpath, MAX_CHARS_DOCX_OTHER), MAX_CHARS_DOCX_OTHER)
-
-    # Report PDFs — text extraction only, no binary upload
-    for fpath in (pdfs_report + pdfs_id)[:MAX_PDFS]:
-        rname = fpath.relative_to(extract_dir)
-        add(f"\n=== PDF: {rname} ===", extract_pdf_text(fpath), MAX_CHARS_PER_PDF)
-
-    # Modelo docx — send the FULL TEXT so Claude can identify what to replace
-    modelo_text = read_docx_text(docx_model, max_chars=200_000)  # full modelo
+    # ─── FONTE 4/4: MODELO DA PETIÇÃO ────────────────────────────────────────
+    modelo_text = read_docx_text(docx_model, max_chars=200_000)
     parts.append(
         f"\n=== MODELO DA PETIÇÃO (texto integral) — arquivo: {docx_model.name} ===\n"
-        f"ATENÇÃO: Identifique TODOS os trechos do modelo abaixo que se referem ao CLIENTE ANTIGO\n"
-        f"(nome, RG, CPF, endereço, pontuação, número do edital, banca, cargo, comarca, etc.)\n"
-        f"e gere pares de 'buscar' (texto antigo) → 'substituir' (texto novo do cliente atual)\n"
-        f"no campo 'substituicoes' do JSON. Inclua TAMBÉM o tipo de ação se for diferente.\n\n"
+        f"Identifique TODOS os trechos que se referem ao CLIENTE ANTIGO\n"
+        f"(nome, RG, CPF, endereço, pontuação, banca, cargo, comarca, questões, etc.)\n"
+        f"e gere pares de 'buscar' (texto antigo) → 'substituir' (valor correto da ficha).\n\n"
         f"{modelo_text}"
     )
 
     full_text = "\n\n".join(parts)
-    log.info("Text block: %d chars (budget: %d)", len(full_text), TOTAL_CHAR_BUDGET)
+    log.info("Text block: %d chars (budget: %d) — fontes: ficha=%s, procuração=%s, "
+             "relatórios=%d, modelo=%s, ignorados=%d",
+             len(full_text), TOTAL_CHAR_BUDGET,
+             "sim" if xlsx_ficha else "não",
+             "sim" if pdf_procuracao else "não",
+             len(docx_relatorios),
+             "sim" if docx_model else "não",
+             len(outros_arquivos))
 
     # Free memory before API call
     del parts
