@@ -4,7 +4,7 @@ Backend Flask com integração Claude API
 Estratégia: extração de texto de todos os arquivos — zero PDFs nativos na API
 """
 
-import os, sys, json, uuid, zipfile, shutil, logging, re, random, base64
+import os, sys, json, uuid, zipfile, shutil, logging, re, random, base64, gc
 from pathlib import Path
 from datetime import datetime
 
@@ -22,15 +22,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB
+app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 MB
 
 # ── Token budget ─────────────────────────────────────────────────────────────
-MAX_CHARS_PER_PDF      = 3_000   # ~750 tokens per PDF
-MAX_CHARS_PER_XLSX     = 4_000
-MAX_CHARS_DOCX_MODEL   = 4_000
-MAX_CHARS_DOCX_OTHER   = 2_500
-MAX_PDFS               = 6       # max number of PDFs to include
-TOTAL_CHAR_BUDGET      = 60_000  # hard ceiling for entire text block (~15k tokens)
+MAX_CHARS_PER_PDF      = 1_500   # reduced for memory
+MAX_CHARS_PER_XLSX     = 2_000
+MAX_CHARS_DOCX_MODEL   = 2_500
+MAX_CHARS_DOCX_OTHER   = 1_500
+MAX_PDFS               = 3       # reduced for memory
+TOTAL_CHAR_BUDGET      = 25_000  # reduced for memory
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -494,9 +494,15 @@ Observações: {form_data.get('obs','')}""")
     full_text = "\n\n".join(parts)
     log.info("Text block: %d chars (budget: %d)", len(full_text), TOTAL_CHAR_BUDGET)
 
+    # Free memory before API call
+    del parts
+    gc.collect()
+
     # 4. Call Claude (text only)
     data = call_claude(api_key, full_text)
     log.info("Claude OK")
+    del full_text
+    gc.collect()
 
     # 5. Unpack modelo
     unpacked_dir = session_dir / "unpacked"
