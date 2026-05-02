@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 # ── VERSION MARKER — change this every release to confirm deploy ──────────
-APP_VERSION = "v33-2026-05-02-round2-desativado"
+APP_VERSION = "v34-2026-05-02-protecao-com-word-boundary"
 log.info("=" * 70)
 log.info("🚀 SilvaPinto GeradorPeticoes %s INICIANDO", APP_VERSION)
 log.info("=" * 70)
@@ -878,19 +878,34 @@ def apply_substitutions(unpacked_dir: Path, data: dict, ficha: dict | None = Non
             estado_correto = (ficha.get("estado_concurso") or "").strip()
             uf_correta = (ficha.get("uf_concurso") or "").strip()
 
-            # Build a list of "correct" terms that must not be replaced
-            correct_terms = [t for t in [inst_correta, sigla_correta,
-                                          estado_correto, uf_correta] if t]
-            old_lower = old.lower()
-            new_lower = new.lower()
+            # Build list of "protected" terms — these must not be removed by IA pairs.
+            # IMPORTANT: exclude 2-letter UF codes (ES, MG, RJ, ...) from protection,
+            # because they're too short and produce false positives:
+            #   - "ES" matches inside "MarquES", "desempregado", "JonES", "NevES"
+            #   - "MG" matches inside "imagine", "ágatas", etc.
+            # We protect only longer, more distinctive terms.
+            protected_terms = []
+            for t in [inst_correta, sigla_correta, estado_correto]:
+                t = (t or "").strip()
+                if t and len(t) >= 4:  # min 4 chars to avoid false positives
+                    protected_terms.append(t)
+
+            # Use word-boundary regex to avoid matching "ES" inside "MARQUES"
+            def _term_in(term: str, text: str) -> bool:
+                """Check if `term` appears as a standalone word/phrase in `text`."""
+                # Escape regex special chars in term
+                pat = re.compile(
+                    r"(?<![A-Za-zÀ-ÿ])" + re.escape(term) + r"(?![A-Za-zÀ-ÿ])",
+                    re.IGNORECASE,
+                )
+                return bool(pat.search(text))
 
             should_block = False
-            for term in correct_terms:
-                if term and term.lower() in old_lower:
-                    # The 'old' contains the CORRECT state/institution.
-                    # Check if 'new' has a DIFFERENT state/institution.
-                    if term.lower() not in new_lower:
-                        # The correct term was REMOVED in the substitution
+            for term in protected_terms:
+                if _term_in(term, old):
+                    # The 'old' contains a CORRECT distinctive term from ficha.
+                    # Check if 'new' STILL has it (just keeping unchanged).
+                    if not _term_in(term, new):
                         log.warning(
                             "Par #%d: tentaria remover '%s' (correto da ficha) "
                             "do texto. Bloqueado. buscar='%s', substituir='%s'",
@@ -910,15 +925,16 @@ def apply_substitutions(unpacked_dir: Path, data: dict, ficha: dict | None = Non
             # try to "correct" PCES to PCMG based on residence — block it.
             uf_residencia = (ficha.get("uf") or "").strip().upper()
             if uf_correta and uf_residencia and uf_correta != uf_residencia:
-                # List of common wrong-state markers based on residence
-                wrong_markers = [
-                    f"PC{uf_residencia}", f"pc{uf_residencia.lower()}",
-                    f"Estado de {_uf_to_state_name(uf_residencia)}",
-                    f"ESTADO DE {_uf_to_state_name(uf_residencia).upper()}",
+                # Wrong-state markers — these are distinctive enough to match safely
+                # (e.g., "PCMG" doesn't accidentally match common Portuguese words)
+                wrong_markers_distinctive = [
+                    f"PC{uf_residencia}",
                     f"Polícia Civil do Estado de {_uf_to_state_name(uf_residencia)}",
                     f"POLÍCIA CIVIL DO ESTADO DE {_uf_to_state_name(uf_residencia).upper()}",
                 ]
-                if any(wm in new for wm in wrong_markers):
+                # Test using word boundary
+                introduces_wrong = any(_term_in(wm, new) for wm in wrong_markers_distinctive)
+                if introduces_wrong:
                     log.warning(
                         "Par #%d: introduziria estado de residência (%s) onde "
                         "deveria estar o estado do concurso (%s). Bloqueado. "
