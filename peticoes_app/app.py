@@ -226,7 +226,8 @@ FORMATO DE RESPOSTA — JSON PURO (sem markdown, sem backticks, sem texto antes 
 
 def call_claude(api_key: str, full_text: str) -> dict:
     """Single text-only call to Claude. No PDFs, no binary — pure text."""
-    client = anthropic.Anthropic(api_key=api_key)
+    # 5-minute timeout: longer than gunicorn's, so Claude has time to respond
+    client = anthropic.Anthropic(api_key=api_key, timeout=300.0, max_retries=2)
     log.info("Sending %d chars to Claude", len(full_text))
     message = client.messages.create(
         model="claude-sonnet-4-5",
@@ -234,6 +235,9 @@ def call_claude(api_key: str, full_text: str) -> dict:
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": full_text}]
     )
+    log.info("Claude response received: %d input tokens, %d output tokens",
+             message.usage.input_tokens if message.usage else 0,
+             message.usage.output_tokens if message.usage else 0)
     raw = "".join(b.text for b in message.content if hasattr(b, "text"))
     raw = re.sub(r"```json\s*", "", raw)
     raw = re.sub(r"```\s*", "", raw)
@@ -409,11 +413,30 @@ def rename_files_by_rol(work_dir: Path, rol: list) -> dict:
 def process_zip(zip_path: Path, session_dir: Path, form_data: dict, api_key: str) -> dict:
     log.info("Pipeline start: %s", zip_path.name)
 
-    # 1. Extract
+    # 1. Extract — handle Brazilian Portuguese filenames with cp437/latin-1 encoding
     extract_dir = session_dir / "extracted"
     extract_dir.mkdir()
     with zipfile.ZipFile(zip_path) as zf:
-        zf.extractall(extract_dir)
+        for info in zf.infolist():
+            # ZIP spec uses cp437 by default; many tools encode filenames as latin-1 or utf-8
+            try:
+                # Try to decode the raw bytes as utf-8 first, then fall back
+                raw = info.filename.encode("cp437", errors="replace")
+                try:
+                    fixed_name = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    fixed_name = raw.decode("latin-1", errors="replace")
+            except Exception:
+                fixed_name = info.filename
+            # Sanitize: ASCII-safe filename for filesystem
+            safe_name = re.sub(r"[^\w\-./ ]", "_", fixed_name)
+            target = extract_dir / safe_name
+            if info.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(info) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
 
     all_files = [f for f in extract_dir.rglob("*") if f.is_file()]
     file_list = [str(f.relative_to(extract_dir)) for f in all_files]
