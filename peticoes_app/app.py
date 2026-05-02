@@ -22,15 +22,17 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 MB
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB
 
 # ── Token budget ─────────────────────────────────────────────────────────────
-MAX_CHARS_PER_PDF      = 1_500   # reduced for memory
-MAX_CHARS_PER_XLSX     = 2_500
-MAX_CHARS_DOCX_MODEL   = 50_000  # send full modelo for find/replace
-MAX_CHARS_DOCX_OTHER   = 1_500
-MAX_PDFS               = 3       # reduced for memory
-TOTAL_CHAR_BUDGET      = 130_000  # raised: full modelo + ficha + relatórios
+# Sem limites artificiais — leitura completa de cada arquivo.
+# Únicos limites são os físicos do modelo (200k tokens input ≈ 700k chars).
+MAX_CHARS_PER_PDF      = 200_000   # essencialmente ilimitado para PDFs típicos
+MAX_CHARS_PER_XLSX     = 200_000
+MAX_CHARS_DOCX_MODEL   = 200_000   # modelo inteiro
+MAX_CHARS_DOCX_OTHER   = 200_000   # relatórios e outros docx inteiros
+MAX_PDFS               = 50        # praticamente todos os PDFs
+TOTAL_CHAR_BUDGET      = 700_000   # ~175k tokens — margem segura abaixo do limite de 200k
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -57,7 +59,7 @@ def extract_pdf_text(fpath: Path, max_chars: int = MAX_CHARS_PER_PDF) -> str:
         text_parts = []
         with open(fpath, "rb") as f:
             reader = pypdf.PdfReader(f, strict=False)
-            for page in reader.pages[:8]:
+            for page in reader.pages:
                 try:
                     t = page.extract_text()
                     if t:
@@ -123,13 +125,30 @@ def parse_ficha_cliente(path: Path) -> dict:
     Returns a dict with computed fields like pontuacao_final = obtida + delta_anulacao.
     """
     out = {}
+
+    # Phrases that indicate the field contains instructions, not real values
+    PLACEHOLDER_PATTERNS = [
+        r"^comarca\s+da\s+residencia",         # "comarca da residencia do cliente"
+        r"^endere[çc]o\s+do\s+cliente",
+        r"^(não|nao)\s+informad",              # "Não informado"
+        r"^a\s+(definir|preencher|verificar)",
+        r"^preencher",
+        r"^marque\s+x",
+        r"^se\s+sim",
+        r"^sim\s*·\s*n[ãa]o",                  # "Sim · Não"
+    ]
+
+    def is_placeholder(value: str) -> bool:
+        if not value:
+            return True
+        v = value.strip().lower()
+        return any(re.match(p, v) for p in PLACEHOLDER_PATTERNS)
+
     try:
         import openpyxl
         wb = openpyxl.load_workbook(str(path), data_only=True)
         ws = wb[wb.sheetnames[0]]
 
-        # Build a label→value map from columns A and B
-        # The ficha has labels in column A and values in column B
         kv = {}
         for row in ws.iter_rows(min_col=1, max_col=2, values_only=True):
             label = (row[0] or "").strip() if isinstance(row[0], str) else ""
@@ -140,9 +159,11 @@ def parse_ficha_cliente(path: Path) -> dict:
                 kv[label.lower()] = value
 
         def find_field(*keywords):
-            """Find first label that contains all keywords."""
+            """Find first label that contains all keywords. Skip placeholders."""
             for label, value in kv.items():
-                if all(kw.lower() in label for kw in keywords) and value and "não informado" not in value.lower():
+                if all(kw.lower() in label for kw in keywords) and value:
+                    if is_placeholder(value):
+                        continue
                     return value
             return ""
 
@@ -188,6 +209,40 @@ def parse_ficha_cliente(path: Path) -> dict:
             cleaned = re.sub(r"\s*\([^)]*\)", "", out["nome_cliente"]).strip()
             if cleaned:
                 out["nome_cliente"] = cleaned
+
+        # Extract structured personal data from "observações" (free text field)
+        obs = out.get("observacoes", "")
+        if obs:
+            # RG: "RG MG16052778" or "RG nº 12345"
+            m = re.search(r"RG\s*(?:n[ºo°.]*\s*)?([A-Z]{0,3}\s*[\d\.\-]+)", obs, re.I)
+            if m: out["rg"] = m.group(1).strip()
+            # CPF
+            m = re.search(r"CPF\s*(?:n[ºo°.]*\s*)?(\d{3}\.\d{3}\.\d{3}-\d{2}|\d{11})", obs, re.I)
+            if m: out["cpf"] = m.group(1).strip()
+            # E-mail
+            m = re.search(r"e-?mail\s*:?\s*([\w\.\-]+@[\w\.\-]+\.\w+)", obs, re.I)
+            if m: out["email"] = m.group(1).strip()
+            # Profissão
+            m = re.search(r"profissão\s*:?\s*([^;,]+)", obs, re.I)
+            if m: out["profissao"] = m.group(1).strip()
+            # Estado civil
+            m = re.search(r"estado civil\s*:?\s*([^;,]+)", obs, re.I)
+            if m: out["estado_civil"] = m.group(1).strip()
+            # Endereço — capture rua/número até CEP
+            m = re.search(r"endere[çc]o\s*:?\s*(.+?)(?:CEP\s*([\d\-]+))?(?:\.|;|$)", obs, re.I)
+            if m:
+                addr = m.group(1).strip().rstrip(",")
+                out["endereco_completo"] = addr
+                if m.group(2):
+                    out["cep"] = m.group(2).strip()
+                # Try to extract city/UF from address: "..., Cidade/UF"
+                cidade_match = re.search(r",\s*([\w\s]+?)\s*/\s*([A-Z]{2})", addr)
+                if cidade_match:
+                    out["cidade"] = cidade_match.group(1).strip()
+                    out["uf"] = cidade_match.group(2).strip()
+                    # Derive comarca from city (only if comarca itself is empty/placeholder)
+                    if not out.get("comarca"):
+                        out["comarca"] = f"{out['cidade'].upper()}/{out['uf']}"
 
         log.info("Ficha parseada: nome=%s, obtida=%s, delta=%s, final=%s, corte=%s",
                  out.get("nome_cliente"), out.get("pontuacao_obtida"),
@@ -265,33 +320,38 @@ e gerar um JSON estruturado para preenchimento da Petição Inicial em modelo .d
 - Para qualquer dado essencial não encontrado, use a marcação curta "[DADO AUSENTE]" e
   inclua no array "dados_ausentes" a descrição do que está faltando.
 
-2. REDAÇÃO JURÍDICA (Fatos, Direito, Pontuação)
-- Linguagem altamente técnica, formal, persuasiva, adequada a Petição Inicial.
-- Capítulo "Da Pontuação": MÁXIMO 3 parágrafos, sempre direto, indicando a pontuação
-  que o candidato alcançará após anulação e dando ÊNFASE em que atingirá a nota de corte
-  para avançar de fase.
-- Capítulo "Da Probabilidade do Direito do Autor": insira na íntegra o relatório técnico
-  de UMA questão (escolha aleatória dentre os relatórios disponíveis no ZIP),
-  no campo "probabilidade_direito".
-- Se o cliente NÃO tiver direito à gratuidade de justiça conforme a ficha, marque
-  "gratuidade": false — o sistema removerá automaticamente o capítulo correspondente
-  e o pedido de gratuidade do rol.
+3. EXTRAÇÃO E SUBSTITUIÇÃO DAS QUESTÕES IMPUGNADAS
+3.1) Identifique na "Ficha do Cliente" o campo "QUESTÕES A ANULAR" — essa lista
+     define quais questões DEVEM aparecer na petição final do novo cliente.
+3.2) No "RELATÓRIO TÉCNICO DAS QUESTÕES" (arquivo .docx separado), localize cada
+     questão dessa lista. Para cada uma, extraia:
+     - O número da questão
+     - O vício (ERRO GROSSEIRO, EXTRAPOLAÇÃO DO EDITAL, DUPLICIDADE DE GABARITO etc.)
+     - O enunciado e as alternativas
+     - O resumo técnico-jurídico de uma frase
+3.3) No MODELO da petição existe um capítulo que lista as questões antigas
+     (do cliente anterior) — ex: "questões 10, 25, 31 e 34 da Prova Tipo 2".
+     Você DEVE gerar pares de substituição para REMOVER os blocos das questões
+     antigas e INSERIR os blocos das questões novas, mantendo a estrutura.
+3.4) Para o capítulo "Da Probabilidade do Direito do Autor", o modelo traz o
+     relatório técnico completo de UMA questão antiga. Você deve gerar um par
+     de substituição que TROQUE esse relatório antigo pelo relatório íntegro
+     de UMA das questões novas (escolha a primeira da lista, ou a com vício
+     mais grave).
+3.5) Popule o array "questoes" do JSON com cada questão nova:
+     numero, vicio, resumo_peticao, enunciado, alternativas, gabarito_banca,
+     resposta_correta, relatorio_integra (para a questão de destaque).
+3.6) Em "questao_destaque_idx" indique o índice (0-based) da questão escolhida
+     para o capítulo "Da Probabilidade do Direito".
 
-3. EXTRAÇÃO E RESUMO DAS QUESTÕES A ANULAR
-- Identifique no arquivo "ficha do candidato" quais questões o autor pretende anular.
-- Para cada questão indicada, leia o relatório técnico correspondente (arquivos
-  nomeados como "Questões", "Relatório Técnico", "Parecer" etc.).
-- Redija um parágrafo único, técnico e objetivo no campo "resumo_peticao", contendo:
-  (a) o vício identificado (erro grosseiro, extrapolação do edital, duplicidade de
-  gabarito, etc.), (b) a análise matemática ou jurídica que comprova o vício,
-  (c) a consequência para o candidato.
-- Se o relatório técnico já trouxer um resumo, utilize-o; senão, sintetize a
-  fundamentação em um parágrafo claro, direto e convincente.
-- Para cada questão, identifique o vício e nomeie no campo "vicio" (ex: "ERRO GROSSEIRO",
-  "EXTRAPOLAÇÃO DO EDITAL", "DUPLICIDADE DE GABARITO", "AUSÊNCIA DE RESPOSTA CORRETA").
-- O comando da questão e o enunciado devem ficar juntos em um único parágrafo no campo
-  "enunciado". As alternativas devem ser listadas no array "alternativas",
-  uma por elemento (ex: "A) texto", "B) texto"...).
+REDAÇÃO JURÍDICA (Fatos, Direito, Pontuação)
+- Linguagem altamente técnica, formal, persuasiva, adequada a Petição Inicial.
+- Capítulo "Da Pontuação": MÁXIMO 3 parágrafos, indicando a pontuação que o
+  candidato alcançará após anulação e dando ÊNFASE em que atingirá a nota de corte.
+- Use SEMPRE a "PONTUAÇÃO FINAL APÓS ANULAÇÕES" calculada nos DADOS AUTORITATIVOS.
+  Nunca invente outro número.
+- Se o cliente NÃO tiver direito à gratuidade conforme a ficha, marque
+  "gratuidade": false — o sistema removerá o capítulo correspondente.
 
 4. ROL DE DOCUMENTOS
 - Liste em "rol_documentos" todos os documentos que devem instruir a petição,
@@ -536,7 +596,7 @@ def call_claude(api_key: str, full_text: str) -> dict:
     log.info("Sending %d chars to Claude", len(full_text))
     message = client.messages.create(
         model="claude-sonnet-4-5",
-        max_tokens=16000,  # increased to avoid JSON truncation
+        max_tokens=64000,  # max para Claude Sonnet 4.5
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": full_text}]
     )
@@ -967,56 +1027,69 @@ Observações: {form_data.get('obs','')}""")
             break
     # If ficha was found, build authoritative block FIRST
     if ficha_estruturada:
+        fe = ficha_estruturada
         auth_block = ["\n=== DADOS AUTORITATIVOS DO CLIENTE (extraídos da Ficha — USE EXATAMENTE ESTES VALORES) ==="]
-        if ficha_estruturada.get("nome_cliente"):
-            auth_block.append(f"NOME DO CLIENTE: {ficha_estruturada['nome_cliente']}")
-        if ficha_estruturada.get("concurso"):
-            auth_block.append(f"CONCURSO: {ficha_estruturada['concurso']}")
-        if ficha_estruturada.get("banca"):
-            auth_block.append(f"BANCA: {ficha_estruturada['banca']}")
-        if ficha_estruturada.get("cargo"):
-            auth_block.append(f"CARGO: {ficha_estruturada['cargo']}")
-        if ficha_estruturada.get("comarca"):
-            auth_block.append(f"COMARCA: {ficha_estruturada['comarca']}")
-        if ficha_estruturada.get("tipo_prova"):
-            auth_block.append(f"TIPO DE PROVA: {ficha_estruturada['tipo_prova']}")
-        if ficha_estruturada.get("pontuacao_obtida"):
-            auth_block.append(f"PONTUAÇÃO OBTIDA: {ficha_estruturada['pontuacao_obtida']}")
-        if ficha_estruturada.get("delta_anulacao"):
-            auth_block.append(f"GANHO COM AS ANULAÇÕES (delta): {ficha_estruturada['delta_anulacao']}")
-        if ficha_estruturada.get("pontuacao_final_calculada"):
-            auth_block.append(
-                f"PONTUAÇÃO FINAL APÓS ANULAÇÕES (CALCULADA = obtida + delta): "
-                f"{ficha_estruturada['pontuacao_final_calculada']}"
-            )
-            auth_block.append(
-                f"⚠️ USE EXATAMENTE '{ficha_estruturada['pontuacao_final_calculada']}' "
-                f"em TODAS as referências à pontuação final do cliente. "
-                f"NUNCA invente outro valor. NUNCA escreva o delta ({ficha_estruturada.get('delta_anulacao','')}) "
-                f"como se fosse a pontuação final."
-            )
-        if ficha_estruturada.get("nota_corte"):
-            auth_block.append(f"NOTA DE CORTE: {ficha_estruturada['nota_corte']}")
+        if fe.get("nome_cliente"):
+            auth_block.append(f"NOME COMPLETO: {fe['nome_cliente']}")
+        if fe.get("rg"):
+            auth_block.append(f"RG: {fe['rg']}")
+        if fe.get("cpf"):
+            auth_block.append(f"CPF: {fe['cpf']}")
+        if fe.get("estado_civil"):
+            auth_block.append(f"ESTADO CIVIL: {fe['estado_civil']}")
+        if fe.get("profissao"):
+            auth_block.append(f"PROFISSÃO: {fe['profissao']}")
+        if fe.get("email"):
+            auth_block.append(f"E-MAIL: {fe['email']}")
+        if fe.get("endereco_completo"):
+            auth_block.append(f"ENDEREÇO: {fe['endereco_completo']}")
+        if fe.get("cidade"):
+            auth_block.append(f"CIDADE: {fe['cidade']}")
+        if fe.get("uf"):
+            auth_block.append(f"UF: {fe['uf']}")
+        if fe.get("cep"):
+            auth_block.append(f"CEP: {fe['cep']}")
+        if fe.get("comarca"):
+            auth_block.append(f"COMARCA (de endereçamento): {fe['comarca']}")
+        if fe.get("concurso"):
+            auth_block.append(f"CONCURSO: {fe['concurso']}")
+        if fe.get("banca"):
+            auth_block.append(f"BANCA: {fe['banca']}")
+        if fe.get("cargo"):
+            auth_block.append(f"CARGO: {fe['cargo']}")
         else:
-            auth_block.append("NOTA DE CORTE: [NÃO INFORMADA NA FICHA — mantenha a do modelo ou marque [DADO AUSENTE]]")
-        if ficha_estruturada.get("questoes_anular"):
-            auth_block.append(f"QUESTÕES A ANULAR: {ficha_estruturada['questoes_anular']}")
-        if ficha_estruturada.get("gratuidade"):
-            auth_block.append(f"REQUER GRATUIDADE: {ficha_estruturada['gratuidade']}")
-        if ficha_estruturada.get("eliminado"):
-            auth_block.append(f"AUTOR ELIMINADO: {ficha_estruturada['eliminado']}")
-        if ficha_estruturada.get("tipo_acao"):
-            auth_block.append(f"TIPO DE AÇÃO: {ficha_estruturada['tipo_acao']}")
-        if ficha_estruturada.get("resumo_fatos"):
-            auth_block.append(f"RESUMO DOS FATOS (cliente): {ficha_estruturada['resumo_fatos']}")
-        if ficha_estruturada.get("observacoes"):
-            auth_block.append(f"OBSERVAÇÕES (dados pessoais detalhados): {ficha_estruturada['observacoes']}")
-        if ficha_estruturada.get("proxima_fase"):
-            auth_block.append(f"PRÓXIMA FASE DO CERTAME: {ficha_estruturada['proxima_fase']}")
+            auth_block.append("CARGO: [NÃO INFORMADO — manter o do modelo ou marcar [DADO AUSENTE]]")
+        if fe.get("tipo_prova"):
+            auth_block.append(f"TIPO DE PROVA: Tipo {fe['tipo_prova'].replace('Tipo','').strip()}")
+        if fe.get("pontuacao_obtida"):
+            auth_block.append(f"PONTUAÇÃO OBTIDA pelo cliente: {fe['pontuacao_obtida']}")
+        if fe.get("delta_anulacao"):
+            auth_block.append(f"GANHO COM AS ANULAÇÕES (delta — NÃO É O TOTAL FINAL): {fe['delta_anulacao']}")
+        if fe.get("pontuacao_final_calculada"):
+            auth_block.append(
+                f"⚠️ PONTUAÇÃO FINAL APÓS ANULAÇÕES (TOTAL — USE ESTE VALOR): "
+                f"{fe['pontuacao_final_calculada']}"
+            )
+        if fe.get("nota_corte"):
+            auth_block.append(f"NOTA DE CORTE: {fe['nota_corte']}")
+        else:
+            auth_block.append("NOTA DE CORTE: [NÃO INFORMADA NA FICHA]")
+        if fe.get("questoes_anular"):
+            auth_block.append(f"QUESTÕES A ANULAR: {fe['questoes_anular']}")
+        if fe.get("gratuidade"):
+            auth_block.append(f"REQUER GRATUIDADE DE JUSTIÇA: {fe['gratuidade']}")
+        if fe.get("eliminado"):
+            auth_block.append(f"AUTOR ELIMINADO?: {fe['eliminado']}")
+        if fe.get("tipo_acao"):
+            auth_block.append(f"TIPO DE AÇÃO: {fe['tipo_acao']}")
+        if fe.get("resumo_fatos"):
+            auth_block.append(f"RESUMO DOS FATOS (cliente): {fe['resumo_fatos']}")
         auth_block.append(
-            "⚠️ TODOS os pares de 'substituicoes' que envolvam pontuação, comarca, banca, cargo, "
-            "tipo de prova, questões a anular, etc. DEVEM usar EXATAMENTE os valores acima. "
-            "Se um campo está vazio aqui, marque como [DADO AUSENTE] na petição.\n"
+            "\n⚠️ REGRA CRÍTICA: TODOS os pares de 'substituicoes' DEVEM usar EXATAMENTE os valores acima.\n"
+            "- Para a pontuação final, use SEMPRE o valor calculado acima — NUNCA invente outro número.\n"
+            "- Para a comarca, use SEMPRE o valor calculado acima (ex: 'MATIPÓ/MG').\n"
+            "- Se um campo está marcado como [NÃO INFORMADO], NÃO crie par de substituição para ele —\n"
+            "  mantenha o valor do modelo intacto.\n"
         )
         parts.append("\n".join(auth_block))
 
@@ -1024,8 +1097,36 @@ Observações: {form_data.get('obs','')}""")
         rname = fpath.relative_to(extract_dir)
         add(f"\n=== TEXTO: {rname} ===", read_text_file(fpath), MAX_CHARS_PER_XLSX)
 
-    # Other DOCX (relatórios em docx, fichas)
+    # Other DOCX — separate "relatórios técnicos" (questões) from outros docx
+    relatorio_keywords = ("relatorio", "relatório", "questao", "questão",
+                          "questoes", "questões", "tecnico", "técnico",
+                          "parecer", "fundamentacao", "fundamentação")
+    relatorios_docx = []
+    outros_docx = []
     for fpath in other_docx:
+        nl = fpath.name.lower()
+        if any(k in nl for k in relatorio_keywords):
+            relatorios_docx.append(fpath)
+        else:
+            outros_docx.append(fpath)
+
+    # Relatórios técnicos com prioridade — sem truncamento agressivo
+    for fpath in relatorios_docx:
+        rname = fpath.relative_to(extract_dir)
+        full_relat = read_docx_text(fpath, max_chars=200_000)  # full report
+        parts.append(
+            f"\n=== RELATÓRIO TÉCNICO DAS QUESTÕES — arquivo: {rname} ===\n"
+            f"ATENÇÃO: Este arquivo contém os pareceres técnicos das questões impugnáveis.\n"
+            f"Identifique cada questão (pelo número), seu vício, e o resumo da fundamentação.\n"
+            f"Para CADA questão que está na lista de 'Questões a Anular' da ficha do cliente,\n"
+            f"gere um par de substituição que TROQUE o resumo da questão antiga (no modelo)\n"
+            f"pelo resumo da questão nova (deste relatório).\n"
+            f"E em 'questoes' do JSON, popule número, vício, resumo_peticao, enunciado e relatorio_integra.\n\n"
+            f"{full_relat}"
+        )
+
+    # Outros DOCX (não-relatórios)
+    for fpath in outros_docx:
         rname = fpath.relative_to(extract_dir)
         add(f"\n=== DOCX: {rname} ===", read_docx_text(fpath, MAX_CHARS_DOCX_OTHER), MAX_CHARS_DOCX_OTHER)
 
@@ -1035,7 +1136,7 @@ Observações: {form_data.get('obs','')}""")
         add(f"\n=== PDF: {rname} ===", extract_pdf_text(fpath), MAX_CHARS_PER_PDF)
 
     # Modelo docx — send the FULL TEXT so Claude can identify what to replace
-    modelo_text = read_docx_text(docx_model, max_chars=50_000)  # full modelo
+    modelo_text = read_docx_text(docx_model, max_chars=200_000)  # full modelo
     parts.append(
         f"\n=== MODELO DA PETIÇÃO (texto integral) — arquivo: {docx_model.name} ===\n"
         f"ATENÇÃO: Identifique TODOS os trechos do modelo abaixo que se referem ao CLIENTE ANTIGO\n"
@@ -1073,7 +1174,7 @@ Observações: {form_data.get('obs','')}""")
             current_xml = doc_xml_path.read_text(encoding="utf-8")
             current_text = re.sub(r"<[^>]+>", " ", current_xml)
             current_text = re.sub(r"\s+", " ", current_text).strip()
-            current_text_limited = current_text[:30_000]
+            current_text_limited = current_text[:200_000]
 
             # Build authoritative client data block — prefer ficha values
             auth_lines = ["DADOS CORRETOS DO CLIENTE (use EXATAMENTE estes valores):"]
@@ -1107,19 +1208,20 @@ Observações: {form_data.get('obs','')}""")
 
             review_prompt = f"""{chr(10).join(auth_lines)}
 
-TAREFA: Analise o TEXTO DA PETIÇÃO abaixo. Identifique QUALQUER trecho que ainda contenha:
-- Dados de OUTRO cliente (nome, RG, CPF, endereço diferentes dos corretos acima)
-- Pontuações INCONSISTENTES (que não correspondam aos valores corretos acima)
-- Comarca, banca, cargo ou tipo de prova diferentes dos valores corretos
+TAREFA: Analise o TEXTO DA PETIÇÃO abaixo. Identifique APENAS trechos que CONTRADIGAM
+diretamente os DADOS CORRETOS acima (ou seja, dados de outro cliente que ainda restaram).
 
-Para cada inconsistência encontrada, gere um par {{"buscar": "texto exato como aparece", "substituir": "texto correto"}}.
+REGRAS RIGOROSAS:
+- Só gere par de substituição se o texto da petição contém um valor DIFERENTE do correto.
+- NÃO gere pares se o texto já está correto (mesmo que pareça simplificado).
+- NÃO gere pares para o cabeçalho de endereçamento já correto.
+- NÃO substitua valores corretos por valores semelhantes.
+- Se o texto está correto: retorne {{"substituicoes": []}}.
+- Cada par precisa ter "buscar" e "substituir" como strings NÃO VAZIAS.
 
-REGRAS DO RETORNO:
-- Retorne APENAS JSON puro válido. Sem markdown, sem ```, sem explicações.
-- Use o formato: {{"substituicoes": [...]}}
-- Se não houver nada a substituir: {{"substituicoes": []}}
-- Cada par deve ter "buscar" e "substituir" preenchidos com strings não vazias.
-- "buscar" deve ser texto LITERAL exato como aparece no texto.
+Para cada inconsistência ENCONTRADA, gere {{"buscar": "texto literal exato", "substituir": "valor correto"}}.
+
+Retorne APENAS JSON puro — sem markdown, sem ```, sem explicações.
 
 TEXTO DA PETIÇÃO ATUAL:
 {current_text_limited}"""
@@ -1128,7 +1230,7 @@ TEXTO DA PETIÇÃO ATUAL:
             client = anthropic.Anthropic(api_key=api_key, timeout=300.0, max_retries=2)
             review_msg = client.messages.create(
                 model="claude-sonnet-4-5",
-                max_tokens=8000,
+                max_tokens=32000,
                 system="Você é um revisor jurídico extremamente atento. Sua única tarefa é identificar inconsistências de dados entre uma petição editada e os dados corretos do cliente. Retorne APENAS JSON puro.",
                 messages=[{"role": "user", "content": review_prompt}]
             )
