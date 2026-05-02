@@ -21,6 +21,12 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
+# ── VERSION MARKER — change this every release to confirm deploy ──────────
+APP_VERSION = "v31-2026-05-02-extrator-equivalencia"
+log.info("=" * 70)
+log.info("🚀 SilvaPinto GeradorPeticoes %s INICIANDO", APP_VERSION)
+log.info("=" * 70)
+
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB
 
@@ -2322,12 +2328,13 @@ TEXTO DA PETIÇÃO ATUAL:
     log.info("Done: %s", zip_name)
     return {
         "success":        True,
+        "version":        APP_VERSION,
         "zip_filename":   zip_name,
         "docx_filename":  out_name,
         "cliente":        data.get("cliente", {}),
         "processo":       data.get("processo", {}),
         "questoes":       [{"numero": q.get("numero"), "vicio": q.get("vicio")} for q in data.get("questoes", [])],
-        "changes":        changes,
+        "changes":        [f"🔖 Backend {APP_VERSION}"] + changes,
         "rename_map":     rename_map,
         "dados_ausentes": data.get("dados_ausentes", []),
         "relatorio":      data.get("relatorio_alteracoes", []),
