@@ -117,6 +117,100 @@ def read_text_file(path: Path, max_chars: int = MAX_CHARS_PER_XLSX) -> str:
     except Exception:
         return ""
 
+
+def parse_ficha_cliente(path: Path) -> dict:
+    """Parse the structured 'Ficha do Cliente' XLSX to extract key fields.
+    Returns a dict with computed fields like pontuacao_final = obtida + delta_anulacao.
+    """
+    out = {}
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(str(path), data_only=True)
+        ws = wb[wb.sheetnames[0]]
+
+        # Build a label→value map from columns A and B
+        # The ficha has labels in column A and values in column B
+        kv = {}
+        for row in ws.iter_rows(min_col=1, max_col=2, values_only=True):
+            label = (row[0] or "").strip() if isinstance(row[0], str) else ""
+            value = (row[1] or "").strip() if isinstance(row[1], str) else ""
+            if not label and not value:
+                continue
+            if label:
+                kv[label.lower()] = value
+
+        def find_field(*keywords):
+            """Find first label that contains all keywords."""
+            for label, value in kv.items():
+                if all(kw.lower() in label for kw in keywords) and value and "não informado" not in value.lower():
+                    return value
+            return ""
+
+        # Extract structured fields
+        out["nome_cliente"]      = find_field("nome", "cliente")
+        out["concurso"]          = find_field("nome do concurso") or find_field("concurso *")
+        out["banca"]             = find_field("banca")
+        out["cargo"]             = find_field("cargo")
+        out["comarca"]           = find_field("comarca")
+        out["pontuacao_obtida"]  = find_field("pontuação obtida")
+        out["nota_corte"]        = find_field("nota de corte")
+        out["delta_anulacao"]    = find_field("pontuação possível após anulações") or find_field("após anulações")
+        out["tipo_prova"]        = find_field("tipo da prova") or find_field("tipo de prova impugnada")
+        out["questoes_anular"]   = find_field("questões a anular") or find_field("questoes a anular")
+        out["gratuidade"]        = find_field("requer gratuidade")
+        out["eliminado"]         = find_field("eliminado")
+        out["resumo_fatos"]      = find_field("resumo dos fatos")
+        out["observacoes"]       = find_field("observações") or find_field("instruções específicas")
+        out["tipo_acao"]         = find_field("tipo de ação")
+        out["proxima_fase"]      = find_field("data da próxima fase") or find_field("próxima fase")
+
+        # Compute pontuacao_final: obtida + delta
+        try:
+            obtida_num = _extract_number(out["pontuacao_obtida"])
+            delta_num  = _extract_number(out["delta_anulacao"])
+            if obtida_num is not None and delta_num is not None:
+                final = obtida_num + delta_num
+                # Format as integer if whole, else with decimal
+                final_str = str(int(final)) if final == int(final) else f"{final}"
+                obtida_str = str(int(obtida_num)) if obtida_num == int(obtida_num) else f"{obtida_num}"
+                delta_str  = str(int(delta_num))  if delta_num == int(delta_num)  else f"{delta_num}"
+                out["pontuacao_final_calculada"] = f"{final_str} pontos"
+                out["pontuacao_obtida_clean"]    = f"{obtida_str} pontos"
+                out["delta_clean"]               = f"{delta_str} pontos"
+                out["pontuacao_final_num"]       = final
+                out["pontuacao_obtida_num"]      = obtida_num
+                out["delta_num"]                 = delta_num
+        except Exception:
+            pass
+
+        # Clean name: remove anything in parentheses
+        if out.get("nome_cliente"):
+            cleaned = re.sub(r"\s*\([^)]*\)", "", out["nome_cliente"]).strip()
+            if cleaned:
+                out["nome_cliente"] = cleaned
+
+        log.info("Ficha parseada: nome=%s, obtida=%s, delta=%s, final=%s, corte=%s",
+                 out.get("nome_cliente"), out.get("pontuacao_obtida"),
+                 out.get("delta_anulacao"), out.get("pontuacao_final_calculada"),
+                 out.get("nota_corte"))
+    except Exception as e:
+        log.warning("Falha ao parsear ficha: %s", e)
+    return out
+
+
+def _extract_number(text: str) -> float | None:
+    """Extract first numeric value from text like '66 pontos' or '6 pts'."""
+    if not text:
+        return None
+    m = re.search(r"(\d+(?:[.,]\d+)?)", text)
+    if m:
+        try:
+            return float(m.group(1).replace(",", "."))
+        except ValueError:
+            return None
+    return None
+
+
 def unpack_docx(docx_path: Path, out_dir: Path) -> bool:
     """Unpack docx (zip) into directory."""
     try:
@@ -865,6 +959,67 @@ Observações: {form_data.get('obs','')}""")
     char_used = sum(len(p) for p in parts)
 
     # Text files first (ficha xlsx — most critical)
+    # Parse ficha into structured data first, then inject as authoritative
+    ficha_estruturada = {}
+    for fpath in text_files:
+        if fpath.suffix.lower() in (".xlsx", ".xls") and "ficha" in fpath.name.lower():
+            ficha_estruturada = parse_ficha_cliente(fpath)
+            break
+    # If ficha was found, build authoritative block FIRST
+    if ficha_estruturada:
+        auth_block = ["\n=== DADOS AUTORITATIVOS DO CLIENTE (extraídos da Ficha — USE EXATAMENTE ESTES VALORES) ==="]
+        if ficha_estruturada.get("nome_cliente"):
+            auth_block.append(f"NOME DO CLIENTE: {ficha_estruturada['nome_cliente']}")
+        if ficha_estruturada.get("concurso"):
+            auth_block.append(f"CONCURSO: {ficha_estruturada['concurso']}")
+        if ficha_estruturada.get("banca"):
+            auth_block.append(f"BANCA: {ficha_estruturada['banca']}")
+        if ficha_estruturada.get("cargo"):
+            auth_block.append(f"CARGO: {ficha_estruturada['cargo']}")
+        if ficha_estruturada.get("comarca"):
+            auth_block.append(f"COMARCA: {ficha_estruturada['comarca']}")
+        if ficha_estruturada.get("tipo_prova"):
+            auth_block.append(f"TIPO DE PROVA: {ficha_estruturada['tipo_prova']}")
+        if ficha_estruturada.get("pontuacao_obtida"):
+            auth_block.append(f"PONTUAÇÃO OBTIDA: {ficha_estruturada['pontuacao_obtida']}")
+        if ficha_estruturada.get("delta_anulacao"):
+            auth_block.append(f"GANHO COM AS ANULAÇÕES (delta): {ficha_estruturada['delta_anulacao']}")
+        if ficha_estruturada.get("pontuacao_final_calculada"):
+            auth_block.append(
+                f"PONTUAÇÃO FINAL APÓS ANULAÇÕES (CALCULADA = obtida + delta): "
+                f"{ficha_estruturada['pontuacao_final_calculada']}"
+            )
+            auth_block.append(
+                f"⚠️ USE EXATAMENTE '{ficha_estruturada['pontuacao_final_calculada']}' "
+                f"em TODAS as referências à pontuação final do cliente. "
+                f"NUNCA invente outro valor. NUNCA escreva o delta ({ficha_estruturada.get('delta_anulacao','')}) "
+                f"como se fosse a pontuação final."
+            )
+        if ficha_estruturada.get("nota_corte"):
+            auth_block.append(f"NOTA DE CORTE: {ficha_estruturada['nota_corte']}")
+        else:
+            auth_block.append("NOTA DE CORTE: [NÃO INFORMADA NA FICHA — mantenha a do modelo ou marque [DADO AUSENTE]]")
+        if ficha_estruturada.get("questoes_anular"):
+            auth_block.append(f"QUESTÕES A ANULAR: {ficha_estruturada['questoes_anular']}")
+        if ficha_estruturada.get("gratuidade"):
+            auth_block.append(f"REQUER GRATUIDADE: {ficha_estruturada['gratuidade']}")
+        if ficha_estruturada.get("eliminado"):
+            auth_block.append(f"AUTOR ELIMINADO: {ficha_estruturada['eliminado']}")
+        if ficha_estruturada.get("tipo_acao"):
+            auth_block.append(f"TIPO DE AÇÃO: {ficha_estruturada['tipo_acao']}")
+        if ficha_estruturada.get("resumo_fatos"):
+            auth_block.append(f"RESUMO DOS FATOS (cliente): {ficha_estruturada['resumo_fatos']}")
+        if ficha_estruturada.get("observacoes"):
+            auth_block.append(f"OBSERVAÇÕES (dados pessoais detalhados): {ficha_estruturada['observacoes']}")
+        if ficha_estruturada.get("proxima_fase"):
+            auth_block.append(f"PRÓXIMA FASE DO CERTAME: {ficha_estruturada['proxima_fase']}")
+        auth_block.append(
+            "⚠️ TODOS os pares de 'substituicoes' que envolvam pontuação, comarca, banca, cargo, "
+            "tipo de prova, questões a anular, etc. DEVEM usar EXATAMENTE os valores acima. "
+            "Se um campo está vazio aqui, marque como [DADO AUSENTE] na petição.\n"
+        )
+        parts.append("\n".join(auth_block))
+
     for fpath in text_files:
         rname = fpath.relative_to(extract_dir)
         add(f"\n=== TEXTO: {rname} ===", read_text_file(fpath), MAX_CHARS_PER_XLSX)
@@ -918,26 +1073,55 @@ Observações: {form_data.get('obs','')}""")
             current_xml = doc_xml_path.read_text(encoding="utf-8")
             current_text = re.sub(r"<[^>]+>", " ", current_xml)
             current_text = re.sub(r"\s+", " ", current_text).strip()
-            # Limit to 30k chars for review
             current_text_limited = current_text[:30_000]
 
+            # Build authoritative client data block — prefer ficha values
+            auth_lines = ["DADOS CORRETOS DO CLIENTE (use EXATAMENTE estes valores):"]
+            if ficha_estruturada:
+                fe = ficha_estruturada
+                if fe.get("nome_cliente"):
+                    auth_lines.append(f"- Nome: {fe['nome_cliente']}")
+                if fe.get("comarca"):
+                    auth_lines.append(f"- Comarca: {fe['comarca']}")
+                if fe.get("banca"):
+                    auth_lines.append(f"- Banca: {fe['banca']}")
+                if fe.get("cargo"):
+                    auth_lines.append(f"- Cargo: {fe['cargo']}")
+                if fe.get("tipo_prova"):
+                    auth_lines.append(f"- Tipo de prova: {fe['tipo_prova']}")
+                if fe.get("pontuacao_obtida"):
+                    auth_lines.append(f"- Pontuação obtida: {fe['pontuacao_obtida']}")
+                if fe.get("pontuacao_final_calculada"):
+                    auth_lines.append(f"- Pontuação final após anulações: {fe['pontuacao_final_calculada']}")
+                if fe.get("nota_corte"):
+                    auth_lines.append(f"- Nota de corte: {fe['nota_corte']}")
+                if fe.get("questoes_anular"):
+                    auth_lines.append(f"- Questões a anular: {fe['questoes_anular']}")
             cliente_novo = data.get("cliente", {})
-            processo = data.get("processo", {})
+            if cliente_novo.get("rg"):
+                auth_lines.append(f"- RG: {cliente_novo['rg']}")
+            if cliente_novo.get("cpf"):
+                auth_lines.append(f"- CPF: {cliente_novo['cpf']}")
+            if cliente_novo.get("endereco"):
+                auth_lines.append(f"- Endereço: {cliente_novo['endereco']}, {cliente_novo.get('cidade','')}/{cliente_novo.get('uf','')}")
 
-            review_prompt = f"""Abaixo está o texto da petição APÓS a primeira rodada de substituições.
-O cliente correto é: {cliente_novo.get('nome_completo','')}, RG {cliente_novo.get('rg','')}, CPF {cliente_novo.get('cpf','')}.
-Endereço: {cliente_novo.get('endereco','')}, {cliente_novo.get('cidade','')}/{cliente_novo.get('uf','')}.
-Comarca correta: {processo.get('comarca','')}.
-Pontuação obtida: {processo.get('pontuacao_obtida','')}, após anulação: {processo.get('pontuacao_apos_anulacao','')}, corte: {processo.get('pontuacao_corte','')}.
-Cargo: {processo.get('cargo','')}, Banca: {processo.get('banca','')}.
+            review_prompt = f"""{chr(10).join(auth_lines)}
 
-ANALISE o texto abaixo e identifique QUAISQUER dados que ainda pertençam ao cliente antigo
-(nomes, números, endereços, pontuações, comarcas etc.) que precisem ser substituídos.
-Retorne APENAS um JSON puro com o array "substituicoes" (mesmo formato anterior).
-Se nada precisa ser substituído, retorne {{"substituicoes": []}}.
-Não inclua explicações nem markdown.
+TAREFA: Analise o TEXTO DA PETIÇÃO abaixo. Identifique QUALQUER trecho que ainda contenha:
+- Dados de OUTRO cliente (nome, RG, CPF, endereço diferentes dos corretos acima)
+- Pontuações INCONSISTENTES (que não correspondam aos valores corretos acima)
+- Comarca, banca, cargo ou tipo de prova diferentes dos valores corretos
 
-TEXTO DA PETIÇÃO (após primeira rodada):
+Para cada inconsistência encontrada, gere um par {{"buscar": "texto exato como aparece", "substituir": "texto correto"}}.
+
+REGRAS DO RETORNO:
+- Retorne APENAS JSON puro válido. Sem markdown, sem ```, sem explicações.
+- Use o formato: {{"substituicoes": [...]}}
+- Se não houver nada a substituir: {{"substituicoes": []}}
+- Cada par deve ter "buscar" e "substituir" preenchidos com strings não vazias.
+- "buscar" deve ser texto LITERAL exato como aparece no texto.
+
+TEXTO DA PETIÇÃO ATUAL:
 {current_text_limited}"""
 
             log.info("Round 2: enviando %d chars para revisão", len(review_prompt))
@@ -945,25 +1129,40 @@ TEXTO DA PETIÇÃO (após primeira rodada):
             review_msg = client.messages.create(
                 model="claude-sonnet-4-5",
                 max_tokens=8000,
-                system="Você é um revisor jurídico. Identifique dados do cliente antigo que ainda restem no texto e gere pares de substituição em JSON.",
+                system="Você é um revisor jurídico extremamente atento. Sua única tarefa é identificar inconsistências de dados entre uma petição editada e os dados corretos do cliente. Retorne APENAS JSON puro.",
                 messages=[{"role": "user", "content": review_prompt}]
             )
             review_raw = "".join(b.text for b in review_msg.content if hasattr(b, "text"))
-            log.info("Round 2 response: %d output tokens", review_msg.usage.output_tokens if review_msg.usage else 0)
+            log.info("Round 2 response: %d output tokens, raw preview: %s",
+                     review_msg.usage.output_tokens if review_msg.usage else 0,
+                     review_raw[:300])
 
             try:
                 review_data = _parse_claude_json(review_raw)
-                review_pairs = review_data.get("substituicoes", [])
+                review_pairs_raw = review_data.get("substituicoes", [])
+                # Filter out empty pairs
+                review_pairs = [
+                    p for p in review_pairs_raw
+                    if isinstance(p, dict)
+                    and p.get("buscar","").strip()
+                    and p.get("substituir","").strip()
+                    and p.get("buscar","").strip() != p.get("substituir","").strip()
+                ]
                 if review_pairs:
-                    log.info("Round 2: %d pares adicionais para aplicar", len(review_pairs))
-                    review_changes = apply_substitutions(unpacked_dir, {"substituicoes": review_pairs, "processo": {"gratuidade": True}})
-                    changes.extend(["📝 ROUND 2:"] + review_changes)
+                    log.info("Round 2: %d pares válidos adicionais para aplicar (de %d retornados)",
+                             len(review_pairs), len(review_pairs_raw))
+                    review_changes = apply_substitutions(
+                        unpacked_dir,
+                        {"substituicoes": review_pairs, "processo": {"gratuidade": True}}
+                    )
+                    changes.extend(["📝 ROUND 2 (revisão automática):"] + review_changes)
                 else:
-                    log.info("Round 2: nenhum dado antigo detectado")
+                    log.info("Round 2: nenhum par válido (recebidos %d, todos vazios/idênticos)",
+                             len(review_pairs_raw))
                     changes.append("✅ ROUND 2: nenhum dado antigo restante detectado")
             except Exception as e:
-                log.warning("Round 2 review parse failed: %s", e)
-                changes.append(f"⚠️ Round 2 falhou: {e}")
+                log.warning("Round 2 review parse failed: %s. Raw: %s", e, review_raw[:500])
+                changes.append(f"⚠️ Round 2 falhou ao parsear: {e}")
     except Exception as e:
         log.warning("Round 2 skipped: %s", e)
         changes.append(f"⚠️ Round 2 não executou: {e}")
