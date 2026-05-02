@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 # ── VERSION MARKER — change this every release to confirm deploy ──────────
-APP_VERSION = "v31-2026-05-02-extrator-equivalencia"
+APP_VERSION = "v32-2026-05-02-classificador-arquivos"
 log.info("=" * 70)
 log.info("🚀 SilvaPinto GeradorPeticoes %s INICIANDO", APP_VERSION)
 log.info("=" * 70)
@@ -800,21 +800,54 @@ def apply_substitutions(unpacked_dir: Path, data: dict, ficha: dict | None = Non
                 f"⚠️ Par recursivo ignorado (geraria loop): '{old[:60]}' → '{new[:60]}'"
             )
             continue
-        # Reject pairs that would inject placeholder markers into the document
+        # Reject pairs that would inject placeholder/generic markers into the document.
+        # The user has been clear: when info is not in the ficha, KEEP the model text
+        # — never replace it with generic text or warning markers.
         bad_markers = [
+            # Explicit placeholder markers
             "[NÃO INFORMADO", "[NAO INFORMADO", "[NÃO INFORMADA", "[NAO INFORMADA",
             "[DADO AUSENTE", "[RELATÓRIO COMPLETO NÃO FORNECIDO",
             "[RELATÓRIO TÉCNICO", "[NÃO CONSTA", "[NAO CONSTA",
+            "[CARGO NÃO INFORMADO", "[NOTA DE CORTE NÃO INFORMADA",
+            "[A SER PREENCHIDO", "[PREENCHER", "[NÃO ESPECIFICADO",
+            # Generic substitutes that the IA tends to use as "soft placeholders"
+            "NÃO INFORMADA — MANTER",
+            "NAO INFORMADA — MANTER",
+            "NÃO INFORMADO — MANTER",
+            "NAO INFORMADO — MANTER",
+            "MANTER REDAÇÃO GENÉRICA",
+            "MANTER REDACAO GENERICA",
+            "REDAÇÃO GENÉRICA",
+            "REDACAO GENERICA",
         ]
         new_upper = new.upper()
-        if any(marker.upper() in new_upper for marker in bad_markers):
+        # Generic substitute keywords — these should never replace specific content
+        generic_subs = [
+            "CARGO PRETENDIDO",
+            "CARGO DISPUTADO NO CERTAME",
+            "CARGO PRETENDIDO PELO CLIENTE",
+            "CONFORME PREVISTO NO CRONOGRAMA OFICIAL",
+        ]
+        is_bad = any(marker.upper() in new_upper for marker in bad_markers)
+        # Check if a generic substitute is being used to replace specific content.
+        # We only block if the OLD text was specific (longer + contains specific words).
+        is_generic_replacement = False
+        if not is_bad:
+            for gen in generic_subs:
+                if gen in new_upper:
+                    # If the new text is essentially just the generic phrase, block it
+                    if len(new) < 60 and len(old) > 10:
+                        is_generic_replacement = True
+                        break
+
+        if is_bad or is_generic_replacement:
             log.warning(
-                "Par #%d: 'substituir' contém marcador interno (placeholder), pulando. "
+                "Par #%d: 'substituir' contém marcador/genérico, pulando. "
                 "buscar='%s', substituir='%s'",
                 pair_idx, old[:60], new[:80]
             )
             changes.append(
-                f"⚠️ Par com placeholder ignorado: '{old[:50]}' → '{new[:50]}'"
+                f"⚠️ Par com placeholder/genérico ignorado: '{old[:50]}' → '{new[:50]}'"
             )
             continue
 
@@ -1802,12 +1835,44 @@ def process_zip(zip_path: Path, session_dir: Path, form_data: dict, api_key: str
     # Todos os outros arquivos vão para "outros_arquivos" — entram no ZIP final
     # mas NÃO são lidos pela IA, economizando tokens e custos.
 
-    model_keywords      = ("modelo", "peticao", "petição", "inicial")
-    relatorio_keywords  = ("relatorio", "relatório", "questao", "questão",
-                           "questoes", "questões", "parecer", "tecnico", "técnico",
-                           "fundamentacao", "fundamentação")
-    procuracao_keywords = ("procuracao", "procuração", "procuracoes", "procurações")
-    ficha_keywords      = ("ficha",)
+    # Filename normalizer: remove accents AND replace common separators with
+    # spaces. Some ZIP encodings strip non-ASCII chars completely, leaving
+    # truncated words like "relatório" → "relat rio", "questões" → "quest es",
+    # "procuração" → "procura o". Therefore we match on stems (prefixes of
+    # word tokens) instead of full words.
+    import unicodedata as _ud
+    def _norm_name(name: str) -> str:
+        s = name.lower()
+        s = "".join(c for c in _ud.normalize("NFKD", s) if not _ud.combining(c))
+        # Replace separators with spaces — also remove punctuation
+        s = re.sub(r"[_\-\.()\[\]]+", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def _name_has(name_norm: str, stems: tuple) -> bool:
+        """Check if any stem appears as the start of any word token in name_norm.
+        E.g., stem 'relat' matches 'relat rio docx' (truncated 'relatório').
+        Stem 'questa' matches 'questao' or 'quest es' (since the second token
+        of 'quest es' starts with 'es', so we also match against the first 4-5
+        chars of any token."""
+        tokens = name_norm.split()
+        for stem in stems:
+            for tok in tokens:
+                if tok.startswith(stem):
+                    return True
+                # Special case: handle truncated forms like "quest es" where
+                # the original "questões" lost the "õ". The first token "quest"
+                # is a prefix of "questoes"/"questao"/"questa"
+                if stem.startswith(tok) and len(tok) >= 4:
+                    return True
+        return False
+
+    # Stems (prefixes) — chosen to match common truncations
+    model_stems     = ("modelo", "peticao", "peti", "inicial")
+    relatorio_stems = ("relat", "questa", "quest", "questoes", "parecer",
+                       "tecnic", "fundamenta", "anula", "impug", "laudo")
+    procuracao_stems = ("procura",)
+    ficha_stems     = ("ficha",)
 
     docx_model = None
     docx_relatorios = []
@@ -1816,32 +1881,48 @@ def process_zip(zip_path: Path, session_dir: Path, form_data: dict, api_key: str
     outros_arquivos = []  # vão pro ZIP mas não são lidos
 
     for fpath in all_files:
-        nl = fpath.name.lower()
-        if nl.endswith(".docx"):
-            if any(k in nl for k in model_keywords):
+        original = fpath.name
+        nl = _norm_name(original)  # ex: "relat rio t cnico docx"
+        ext = original.lower().rsplit(".", 1)[-1] if "." in original else ""
+        log.info("Classificando arquivo: %r → normalizado: %r (ext=%s)",
+                 original, nl, ext)
+
+        if ext == "docx":
+            if _name_has(nl, model_stems):
                 docx_model = fpath
-            elif any(k in nl for k in relatorio_keywords):
+                log.info("  → modelo: %s", original)
+            elif _name_has(nl, relatorio_stems):
                 docx_relatorios.append(fpath)
+                log.info("  → relatório técnico: %s", original)
             else:
                 outros_arquivos.append(fpath)
-        elif nl.endswith(".pdf"):
-            if any(k in nl for k in procuracao_keywords):
-                if pdf_procuracao is None:  # primeira procuração encontrada
+                log.info("  → outros (docx não classificado): %s", original)
+        elif ext == "pdf":
+            if _name_has(nl, procuracao_stems):
+                if pdf_procuracao is None:
                     pdf_procuracao = fpath
+                    log.info("  → procuração: %s", original)
                 else:
                     outros_arquivos.append(fpath)
             else:
                 outros_arquivos.append(fpath)
-        elif nl.endswith((".xlsx", ".xls")):
-            if any(k in nl for k in ficha_keywords):
+        elif ext in ("xlsx", "xls"):
+            if _name_has(nl, ficha_stems):
                 if xlsx_ficha is None:
                     xlsx_ficha = fpath
+                    log.info("  → ficha do cliente: %s", original)
                 else:
                     outros_arquivos.append(fpath)
             else:
                 outros_arquivos.append(fpath)
         else:
             outros_arquivos.append(fpath)
+
+    log.info(
+        "Classificação final: modelo=%s, relatórios=%d, procuração=%s, ficha=%s, outros=%d",
+        bool(docx_model), len(docx_relatorios), bool(pdf_procuracao),
+        bool(xlsx_ficha), len(outros_arquivos)
+    )
 
     log.info(
         "Classificação: modelo=%s, ficha=%s, procuração=%s, relatórios=%d, "
@@ -1958,17 +2039,38 @@ Observações: {form_data.get('obs','')}""")
             auth_block.append(f"RESUMO DOS FATOS: {fe['resumo_fatos']}")
         auth_block.append(
             "\nREGRAS PARA OS PARES DE SUBSTITUIÇÃO:\n"
-            "1. Use APENAS os valores acima como fonte da verdade.\n"
-            "2. Se um campo NÃO está listado acima (ex: cargo, nota de corte),\n"
-            "   significa que NÃO foi informado pela ficha — NESSE CASO mantenha\n"
-            "   o valor do modelo intacto e NÃO crie par de substituição para ele.\n"
-            "3. NUNCA, em hipótese alguma, escreva textos como '[NÃO INFORMADO]',\n"
-            "   '[DADO AUSENTE]', '[NÃO INFORMADA NA FICHA]' ou similar como VALOR\n"
-            "   da petição final. Esses são marcadores internos, não devem aparecer\n"
-            "   no documento final.\n"
-            "4. O ESTADO E A INSTITUIÇÃO DO CONCURSO já estão corretos no modelo\n"
-            "   se coincidirem com a ficha. NÃO troque '{est}' por outro estado.\n"
-            "   NÃO troque '{inst}' por outra instituição.\n".format(
+            "\n"
+            "🛑 REGRA Nº 1 (a mais importante): SE UM CAMPO NÃO ESTÁ NA FICHA,\n"
+            "VOCÊ NÃO DEVE CRIAR PAR DE SUBSTITUIÇÃO PARA ELE.\n"
+            "\n"
+            "Exemplos de campos que podem NÃO estar na ficha: 'Cargo', 'Nota de corte',\n"
+            "'Banca', 'Datas de etapas do concurso (saúde, aptidão física)' etc.\n"
+            "\n"
+            "Quando um campo não está na ficha:\n"
+            "  - NÃO crie par como 'cargo de Oficial Investigador' → 'cargo pretendido'\n"
+            "  - NÃO crie par como '58 pontos' → '[nota de corte não informada — manter genérico]'\n"
+            "  - NÃO crie par como '21/03/2026' → 'conforme cronograma oficial'\n"
+            "  - NÃO substitua texto específico por descrição genérica.\n"
+            "  - SIMPLESMENTE NÃO MENCIONE esse campo. Se o modelo já tem 'Oficial Investigador',\n"
+            "    deixe assim — o sistema ignora pares para campos não informados.\n"
+            "\n"
+            "🛑 REGRA Nº 2: NUNCA escreva como VALOR da substituição textos como:\n"
+            "  - '[NÃO INFORMADO]', '[DADO AUSENTE]', '[NÃO INFORMADA NA FICHA]'\n"
+            "  - 'manter redação genérica', 'cargo pretendido', 'cargo disputado no certame'\n"
+            "  - 'conforme cronograma oficial', 'conforme previsto no edital'\n"
+            "Esses textos são marcadores internos OU substitutos genéricos que NÃO devem\n"
+            "aparecer no documento final. O sistema rejeita automaticamente pares assim.\n"
+            "\n"
+            "✅ REGRA Nº 3: USE EXATAMENTE OS VALORES DOS DADOS AUTORITATIVOS ACIMA\n"
+            "para os campos que estão lá listados (nome, RG, CPF, endereço, pontuações etc.).\n"
+            "\n"
+            "✅ REGRA Nº 4: O ESTADO E A INSTITUIÇÃO DO CONCURSO já estão corretos\n"
+            "no modelo se coincidirem com a ficha. NÃO troque '{est}' por outro estado.\n"
+            "NÃO troque '{inst}' por outra instituição.\n"
+            "\n"
+            "🛑 REGRA Nº 5: NÃO crie pares de substituição para os blocos do capítulo\n"
+            "'DO ROL DE QUESTÕES ILEGAIS' — o sistema reescreve esse capítulo automaticamente\n"
+            "a partir dos relatórios técnicos.\n".format(
                 est=fe.get("estado_concurso") or "(estado do concurso)",
                 inst=fe.get("instituicao_concurso") or "(instituição do concurso)",
             )
